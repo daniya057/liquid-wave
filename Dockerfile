@@ -16,8 +16,8 @@ COPY . .
 RUN npm run build
 
 # Открываем порт (7860 подходит для Hugging Face Spaces, 3000 — для Render и остальных)
-EXPOSE 7860
-ENV PORT=7860
-ENV HOSTNAME="0.0.0.0"
+# Открываем порт и используем системную переменную PORT для Render
+EXPOSE 3000
 
+# Запускаем Next.js через npm start
 CMD ["npm", "start"]

@@ -3,6 +3,37 @@ import { NextRequest, NextResponse } from 'next/server';
 import yts from 'yt-search';
 import { Track, Album, Artist, WAVE_SEEDS } from '@/lib/instances';
 
+// Кэш в оперативной памяти сервера (живет 30 минут)
+const CACHE_TTL = 30 * 60 * 1000;
+const searchCache = new Map<string, { data: any; expires: number }>();
+
+function getCached(key: string) {
+  const entry = searchCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expires) {
+    searchCache.delete(key);
+    return null;
+  }
+  return entry.data;
+}
+
+function setCached(key: string, data: any) {
+  // Ограничиваем размер кэша до 300 запросов, чтобы не забивать 512 МБ RAM на Render
+  if (searchCache.size >= 300) {
+    const firstKey = searchCache.keys().next().value;
+    if (firstKey) searchCache.delete(firstKey);
+  }
+  searchCache.set(key, { data, expires: Date.now() + CACHE_TTL });
+}
+
+// Вспомогательная функция: не ждем вторичный запрос дольше 2.5 секунд
+function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms)),
+  ]);
+}
+
 function extractVideoId(input: string): string | null {
   const match = input.match(
     /(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/|music\.youtube\.com\/watch\?v=)([a-zA-Z0-9_-]{11})/
@@ -50,33 +81,50 @@ function mapPlaylistsToAlbums(playlists: any[]): Album[] {
 }
 
 export async function GET(request: NextRequest) {
+  const startTime = Date.now();
   const { searchParams } = new URL(request.url);
   const rawQuery = searchParams.get('q')?.trim() || '';
   const mode = searchParams.get('mode');
   const listId = searchParams.get('listId')?.trim();
   const artistName = searchParams.get('artist')?.trim();
 
+  console.log(`[SEARCH] Запрос: q="${rawQuery}" mode="${mode || ''}" listId="${listId || ''}" artist="${artistName || ''}"`);
+
   // 1. Открытие конкретного альбома / плейлиста
   if (listId) {
+    const cacheKey = `list:${listId}`;
+    const cached = getCached(cacheKey);
+    if (cached) {
+      console.log(`[SEARCH] Кэш-хит альбома (${Date.now() - startTime}ms)`);
+      return NextResponse.json(cached);
+    }
+
     try {
       const playlist = await yts({ listId });
       const tracks = mapVideosToTracks(playlist.videos || []);
-      return NextResponse.json({
-        title: playlist.title || 'Альбом',
-        tracks,
-      });
+      const result = { title: playlist.title || 'Альбом', tracks };
+      setCached(cacheKey, result);
+      console.log(`[SEARCH] Альбом загружен: ${tracks.length} треков (${Date.now() - startTime}ms)`);
+      return NextResponse.json(result);
     } catch (err) {
-      console.error('Ошибка загрузки альбома:', err);
+      console.error('[SEARCH] Ошибка загрузки альбома:', err);
       return NextResponse.json({ tracks: [] }, { status: 500 });
     }
   }
 
-  // 2. Открытие страницы артиста (его лучшие треки и альбомы)
+  // 2. Открытие страницы артиста
   if (artistName) {
+    const cacheKey = `artist:${artistName.toLowerCase()}`;
+    const cached = getCached(cacheKey);
+    if (cached) {
+      console.log(`[SEARCH] Кэш-хит артиста (${Date.now() - startTime}ms)`);
+      return NextResponse.json(cached);
+    }
+
     try {
       const [mainRes, albumRes] = await Promise.all([
         yts(artistName),
-        yts(`${artistName} full album`),
+        withTimeout(yts(`${artistName} full album`), 2500, { playlists: [] }),
       ]);
       const tracks = mapVideosToTracks(mainRes.videos || []).slice(0, 20);
       const albums = mapPlaylistsToAlbums([
@@ -84,9 +132,12 @@ export async function GET(request: NextRequest) {
         ...(albumRes.playlists || []),
       ]).slice(0, 12);
 
-      return NextResponse.json({ tracks, albums });
+      const result = { tracks, albums };
+      setCached(cacheKey, result);
+      console.log(`[SEARCH] Артист загружен: ${tracks.length} треков (${Date.now() - startTime}ms)`);
+      return NextResponse.json(result);
     } catch (err) {
-      console.error('Ошибка загрузки артиста:', err);
+      console.error('[SEARCH] Ошибка загрузки артиста:', err);
       return NextResponse.json({ tracks: [], albums: [] }, { status: 500 });
     }
   }
@@ -94,9 +145,13 @@ export async function GET(request: NextRequest) {
   // 3. Прямая ссылка на трек YouTube
   const directId = extractVideoId(rawQuery);
   if (directId) {
+    const cacheKey = `video:${directId}`;
+    const cached = getCached(cacheKey);
+    if (cached) return NextResponse.json(cached);
+
     try {
       const video = await yts({ videoId: directId });
-      return NextResponse.json({
+      const result = {
         tracks: [
           {
             id: video.videoId,
@@ -108,22 +163,36 @@ export async function GET(request: NextRequest) {
         ],
         albums: [],
         artists: [],
-      });
+      };
+      setCached(cacheKey, result);
+      console.log(`[SEARCH] Прямой трек загружен (${Date.now() - startTime}ms)`);
+      return NextResponse.json(result);
     } catch {
       return NextResponse.json({ tracks: [], albums: [], artists: [] }, { status: 404 });
     }
   }
 
   // 4. Полноценный поиск: Треки + Альбомы + Артисты
-  const query =
-    mode === 'wave' || !rawQuery
-      ? WAVE_SEEDS[Math.floor(Math.random() * WAVE_SEEDS.length)]
-      : rawQuery;
+  const isWave = mode === 'wave' || !rawQuery;
+  const query = isWave
+    ? WAVE_SEEDS[Math.floor(Math.random() * WAVE_SEEDS.length)]
+    : rawQuery;
+
+  const cacheKey = `q:${query.toLowerCase()}`;
+  if (!isWave) {
+    const cached = getCached(cacheKey);
+    if (cached) {
+      console.log(`[SEARCH] Мгновенный ответ из кэша для "${query}" (${Date.now() - startTime}ms)`);
+      return NextResponse.json(cached);
+    }
+  }
 
   try {
     const [mainRes, albumRes] = await Promise.all([
       yts(query),
-      mode === 'wave' ? Promise.resolve({ playlists: [] }) : yts(`${query} album`),
+      isWave
+        ? Promise.resolve({ playlists: [] })
+        : withTimeout(yts(`${query} album`), 2500, { playlists: [] }),
     ]);
 
     const tracks = mapVideosToTracks(mainRes.videos || []).slice(0, 25);
@@ -132,7 +201,6 @@ export async function GET(request: NextRequest) {
       ...(albumRes.playlists || []),
     ]).slice(0, 16);
 
-    // Собираем артистов из каналов YouTube, а если их мало — дополняем из авторов найденных треков
     const artistMap = new Map<string, Artist>();
     for (const ch of mainRes.channels || []) {
       if (!ch.name) continue;
@@ -159,13 +227,20 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    return NextResponse.json({
+    const result = {
       tracks,
       albums,
       artists: Array.from(artistMap.values()),
-    });
+    };
+
+    if (!isWave && tracks.length > 0) {
+      setCached(cacheKey, result);
+    }
+
+    console.log(`[SEARCH] Найдено ${tracks.length} треков для "${query}" за ${Date.now() - startTime}ms`);
+    return NextResponse.json(result);
   } catch (err) {
-    console.error('Ошибка поиска:', err);
+    console.error('[SEARCH] Ошибка поиска:', err);
     return NextResponse.json({ tracks: [], albums: [], artists: [] }, { status: 500 });
   }
 }

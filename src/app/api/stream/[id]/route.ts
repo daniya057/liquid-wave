@@ -9,47 +9,109 @@ const execFileAsync = promisify(execFile);
 const urlCache = new Map<string, { url: string; expiresAt: number }>();
 const inFlightRequests = new Map<string, Promise<string>>();
 
+const PIPED_INSTANCES = [
+  'https://pipedapi.kavin.rocks',
+  'https://pipedapi.tokhmi.xyz',
+  'https://api.piped.private.coffee',
+  'https://pipedapi.adminforge.de',
+];
+
 function getYtDlpPath(): string {
   const binName = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
   const localBin = path.join(process.cwd(), 'node_modules', 'youtube-dl-exec', 'bin', binName);
-  // Если в Docker установлен системный yt-dlp, используем его при отсутствии локального
   if (fs.existsSync(localBin)) {
     return localBin;
   }
   return 'yt-dlp';
 }
 
+// Если в Render добавлена переменная YOUTUBE_COOKIES, сохраняем её во временный файл
+function getCookiesFilePath(): string | null {
+  const cookiesContent = process.env.YOUTUBE_COOKIES?.trim();
+  if (!cookiesContent) return null;
+
+  const tmpPath = path.join('/tmp', 'yt_cookies.txt');
+  try {
+    if (!fs.existsSync(tmpPath)) {
+      fs.writeFileSync(tmpPath, cookiesContent, 'utf-8');
+    }
+    return tmpPath;
+  } catch {
+    return null;
+  }
+}
+
 async function resolveWithYtDlp(videoId: string): Promise<string> {
   const start = Date.now();
   const ytDlpPath = getYtDlpPath();
   const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const cookiesPath = getCookiesFilePath();
 
-  const { stdout } = await execFileAsync(
-    ytDlpPath,
-    [
-      '-f',
-      'bestaudio[ext=m4a]/bestaudio',
-      '-g',
-      '--no-warnings',
-      '--no-playlist',
-      '--no-cache-dir',
-      '--no-check-certificates',
-      '--geo-bypass',
-      // КРИТИЧНО ДЛЯ СКОРОСТИ: обходит тяжелую JS-расшифровку на слабом CPU Render
-      '--extractor-args',
-      'youtube:player_client=ios,android',
-      videoUrl,
-    ],
-    { timeout: 15000 }
-  );
+  const args = [
+    '-f',
+    'bestaudio[ext=m4a]/bestaudio',
+    '-g',
+    '--no-warnings',
+    '--no-playlist',
+    '--no-cache-dir',
+    '--no-check-certificates',
+    '--geo-bypass',
+    '--extractor-args',
+    'youtube:player_client=tv_embedded,mweb,ios',
+  ];
 
+  if (cookiesPath) {
+    args.push('--cookies', cookiesPath);
+  }
+
+  args.push(videoUrl);
+
+  const { stdout } = await execFileAsync(ytDlpPath, args, { timeout: 15000 });
   const directUrl = stdout.trim().split('\n')[0];
+
   if (!directUrl || !directUrl.startsWith('http')) {
-    throw new Error('Не удалось получить ссылку на аудио');
+    throw new Error('Не удалось получить ссылку на аудио через yt-dlp');
   }
 
   console.log(`[STREAM] yt-dlp получил ссылку для ${videoId} за ${Date.now() - start}ms`);
   return directUrl;
+}
+
+// Запасной вариант через зеркала, если YouTube заблокировал IP сервера Render
+async function resolveWithFallbackMirrors(videoId: string): Promise<string> {
+  const start = Date.now();
+
+  for (const instance of PIPED_INSTANCES) {
+    try {
+      const res = await fetch(`${instance}/streams/${videoId}`, {
+        signal: AbortSignal.timeout(4000),
+      });
+      if (!res.ok) continue;
+
+      const data = await res.json();
+      const audioStreams: any[] = data.audioStreams || [];
+      const m4a =
+        audioStreams.find((s) => s.mimeType?.includes('audio/mp4')) || audioStreams[0];
+
+      if (m4a?.url) {
+        console.log(`[STREAM] Зеркало ${instance} отдало ${videoId} за ${Date.now() - start}ms`);
+        return m4a.url;
+      }
+    } catch {
+      // Пробуем следующее зеркало
+    }
+  }
+
+  throw new Error('Все источники аудио временно недоступны');
+}
+
+async function resolveAudioUrl(videoId: string): Promise<string> {
+  try {
+    return await resolveWithYtDlp(videoId);
+  } catch (err: any) {
+    console.warn(`[STREAM] yt-dlp не прошёл для ${videoId}, пробую резервный канал...`);
+    return await resolveWithFallbackMirrors(videoId);
+  }
 }
 
 async function getDirectAudioUrl(videoId: string): Promise<string> {
@@ -63,15 +125,13 @@ async function getDirectAudioUrl(videoId: string): Promise<string> {
     return existingPromise;
   }
 
-  const promise = resolveWithYtDlp(videoId)
+  const promise = resolveAudioUrl(videoId)
     .then((url) => {
-      // Ограничиваем размер кэша, чтобы не переполнить память на Render
       if (urlCache.size >= 500) {
         const firstKey = urlCache.keys().next().value;
         if (firstKey) urlCache.delete(firstKey);
       }
 
-      // Ссылки YouTube живут ~5 часов, кэшируем на 3 часа
       urlCache.set(videoId, {
         url,
         expiresAt: Date.now() + 3 * 60 * 60 * 1000,
@@ -102,7 +162,6 @@ export async function GET(
     return NextResponse.json({ error: 'Неверный ID трека' }, { status: 400 });
   }
 
-  // Предзагрузка следующего трека
   if (request.nextUrl.searchParams.get('prefetch') === '1') {
     try {
       await getDirectAudioUrl(id);
@@ -120,7 +179,7 @@ export async function GET(
 
     const fetchHeaders: HeadersInit = {
       'User-Agent':
-        'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     };
     if (rangeHeader) {
       fetchHeaders['Range'] = rangeHeader;
@@ -129,7 +188,6 @@ export async function GET(
     const audioRes = await fetch(audioUrl, { headers: fetchHeaders });
 
     if (!audioRes.ok && audioRes.status !== 206) {
-      console.warn(`[STREAM] Ссылка протухла для ${id} (статус ${audioRes.status}), сбрасываю кэш`);
       urlCache.delete(id);
       return NextResponse.json({ error: 'Поток временно недоступен' }, { status: 502 });
     }
@@ -157,7 +215,7 @@ export async function GET(
       headers,
     });
   } catch (err) {
-    console.error(`[STREAM] Ошибка yt-dlp для ${id}:`, err);
+    console.error(`[STREAM] Не удалось запустить ${id}:`, err);
     urlCache.delete(id);
     return NextResponse.json({ error: 'Ошибка загрузки аудиопотока' }, { status: 502 });
   }

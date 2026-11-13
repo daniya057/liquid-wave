@@ -196,19 +196,22 @@ export default function HomePage() {
         prefetchTrack(activeList[idx + 1]);
       }
 
-      const offlineUrl = await getOfflineUrl(track.id);
-      if (offlineUrl) {
-        await playStream(offlineUrl);
-      } else {
-        await playStream(`/api/stream/${track.id}`);
+      if (isSaved(track.id)) {
+        const offlineUrl = await getOfflineUrl(track.id);
+        if (offlineUrl) {
+          await playStream(offlineUrl);
+          return;
+        }
       }
+      await playStream(`/api/stream/${track.id}`);
     },
-    [queue, isShuffled, prefetchTrack, getOfflineUrl, playStream]
+    [queue, isShuffled, prefetchTrack, isSaved, getOfflineUrl, playStream]
   );
 
   useEffect(() => {
     playTrackRef.current = playTrack;
   }, [playTrack]);
+
   // Поддержка экрана блокировки iPhone и наушников (Media Session API)
   useEffect(() => {
     if (!currentTrack || typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
@@ -498,7 +501,7 @@ export default function HomePage() {
 
   return (
     <div className="min-h-screen bg-[#09090b] text-white flex flex-col md:flex-row selection:bg-teal-500/30">
-      <audio ref={audioRef} crossOrigin="anonymous" preload="auto" />
+      <audio ref={audioRef} preload="auto" playsInline />
 
       {/* БОКОВАЯ ПАНЕЛЬ ДЛЯ КОМПЬЮТЕРА (ПК) */}
       <aside className="hidden md:flex flex-col w-64 shrink-0 bg-[#0c0c10] border-r border-white/10 p-5 pb-28 sticky top-0 h-screen">

@@ -33,7 +33,6 @@ function parseDurationToSeconds(text?: string): number {
   return parts[0] || 0;
 }
 
-// Мгновенный поиск через внутренний JSON API YouTube (300-500ms вместо 15000ms)
 async function fastYoutubeSearch(query: string): Promise<{ tracks: Track[]; albums: Album[] }> {
   const res = await fetch('https://www.youtube.com/youtubei/v1/search?prettyPrint=false', {
     method: 'POST',
@@ -229,11 +228,37 @@ export async function GET(request: NextRequest) {
       tracks = fastRes.tracks.slice(0, 25);
       albums = fastRes.albums.slice(0, 16);
     } catch {
-      // Запасной вариант, если быстрый API не ответил
       const fallback = await yts(query);
       tracks = mapVideosToTracks(fallback.videos || []).slice(0, 25);
     }
 
     const artistMap = new Map<string, Artist>();
     for (const t of tracks) {
-      const cleanAuthor = t.artist.replace(/\s*-\s*Topic$/
+      const cleanAuthor = t.artist.replace(/\s*-\s*Topic$/i, '').trim();
+      const key = cleanAuthor.toLowerCase();
+      if (cleanAuthor && !artistMap.has(key) && artistMap.size < 12) {
+        artistMap.set(key, {
+          id: cleanAuthor,
+          name: cleanAuthor,
+          thumbnail: t.thumbnail,
+        });
+      }
+    }
+
+    const result = {
+      tracks,
+      albums,
+      artists: Array.from(artistMap.values()),
+    };
+
+    if (!isWave && tracks.length > 0) {
+      setCached(cacheKey, result);
+    }
+
+    console.log(`[SEARCH] Найдено ${tracks.length} треков для "${query}" за ${Date.now() - startTime}ms`);
+    return NextResponse.json(result);
+  } catch (err) {
+    console.error('[SEARCH] Ошибка поиска:', err);
+    return NextResponse.json({ tracks: [], albums: [], artists: [] }, { status: 500 });
+  }
+}

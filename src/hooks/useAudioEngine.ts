@@ -26,6 +26,7 @@ export function useAudioEngine(onEnded?: () => void) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const onEndedRef = useRef(onEnded);
   const shouldPlayRef = useRef(false);
+  const lastSrcRef = useRef('');
   const lastPosUpdateRef = useRef(0);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -51,8 +52,6 @@ export function useAudioEngine(onEnded?: () => void) {
       const audio = audioRef.current;
       if (!audio) return;
 
-      // На iOS не подключаем Web Audio граф, пока пользователь сам не тронет эквалайзер,
-      // чтобы Safari не глушил звук при блокировке экрана
       if (isIOSDevice() && !forceConnect && !graphConnectedRef.current) {
         return;
       }
@@ -162,7 +161,6 @@ export function useAudioEngine(onEnded?: () => void) {
 
     const handleCanPlay = () => {
       setIsLoading(false);
-      // Если в фоне следующий трек подгрузился с задержкой, дозапускаем его автоматически
       if (shouldPlayRef.current && audio.paused && !audio.ended) {
         audio.play().catch(() => {});
       }
@@ -233,6 +231,7 @@ export function useAudioEngine(onEnded?: () => void) {
 
       ensureAudioGraph(false);
 
+      lastSrcRef.current = src;
       shouldPlayRef.current = true;
       setIsLoading(true);
       setCurrentTime(0);
@@ -254,16 +253,26 @@ export function useAudioEngine(onEnded?: () => void) {
 
   const togglePlay = useCallback(async () => {
     const audio = audioRef.current;
-    if (!audio || !audio.src) return;
+    if (!audio) return;
+
+    const src = audio.currentSrc || audio.src || lastSrcRef.current;
+    if (!src) return;
 
     ensureAudioGraph(false);
 
-    if (audio.paused) {
+    if (audio.paused || audio.ended || audio.error) {
+      if (audio.error || audio.readyState === 0 || !audio.src) {
+        audio.src = src;
+      }
       shouldPlayRef.current = true;
+      setIsLoading(true);
       try {
         await audio.play();
+        setIsPlaying(true);
       } catch {
-        // игнорируем
+        setIsPlaying(false);
+      } finally {
+        setIsLoading(false);
       }
     } else {
       shouldPlayRef.current = false;

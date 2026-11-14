@@ -84,7 +84,7 @@ export function PlayerBar({
   return (
     <>
       {/* ==================== ДЕСКТОПНАЯ НИЖНЯЯ ПАНЕЛЬ (ПК) ==================== */}
-      <div className="hidden md:grid grid-cols-3 items-center fixed bottom-0 inset-x-0 h-24 bg-[#0c0c10]/95 backdrop-blur-2xl border-t border-white/10 px-6 z-30">
+      <div className="hidden md:grid grid-cols-3 items-center fixed bottom-0 inset-x-0 h-24 bg-[#0c0c10]/95 backdrop-blur-2xl border-t border-white/10 px-6 z-40">
         {/* Левая часть: Обложка, название, лайк, добавить в плейлист */}
         <div className="flex items-center gap-3.5 min-w-0 pr-4">
           <div className="w-14 h-14 rounded-xl overflow-hidden bg-white/[0.06] border border-white/10 shrink-0 flex items-center justify-center">
@@ -108,6 +108,7 @@ export function PlayerBar({
           {track && (
             <div className="flex items-center gap-1 shrink-0">
               <button
+                type="button"
                 onClick={onToggleLike}
                 title="В избранное"
                 className="p-2 rounded-xl hover:bg-white/10 text-white/65 hover:text-pink-400 transition cursor-pointer"
@@ -115,6 +116,7 @@ export function PlayerBar({
                 <Heart className={`w-4 h-4 ${isLiked ? 'fill-pink-400 text-pink-400' : ''}`} />
               </button>
               <button
+                type="button"
                 onClick={onAddToPlaylist}
                 title="Добавить в плейлист"
                 className="p-2 rounded-xl hover:bg-white/10 text-white/65 hover:text-teal-300 transition cursor-pointer"
@@ -129,6 +131,7 @@ export function PlayerBar({
         <div className="flex flex-col items-center gap-2 max-w-xl w-full mx-auto">
           <div className="flex items-center gap-4">
             <button
+              type="button"
               onClick={onToggleShuffle}
               title={isShuffled ? 'Перемешивание включено' : 'Перемешать'}
               className={`p-2 rounded-xl transition cursor-pointer ${
@@ -141,6 +144,7 @@ export function PlayerBar({
             </button>
 
             <button
+              type="button"
               onClick={onPrev}
               disabled={!track}
               title="Предыдущий трек"
@@ -150,6 +154,7 @@ export function PlayerBar({
             </button>
 
             <button
+              type="button"
               onClick={onTogglePlay}
               disabled={!track}
               className="w-10 h-10 rounded-full bg-white text-zinc-950 flex items-center justify-center hover:scale-105 active:scale-95 disabled:opacity-35 transition cursor-pointer shadow"
@@ -164,6 +169,7 @@ export function PlayerBar({
             </button>
 
             <button
+              type="button"
               onClick={onNext}
               disabled={!track}
               title="Следующий трек"
@@ -199,6 +205,7 @@ export function PlayerBar({
         <div className="flex items-center justify-end gap-2 pl-4">
           {track && (
             <button
+              type="button"
               onClick={onDownload}
               disabled={isDownloading || isSaved}
               title={isSaved ? 'Сохранено в офлайн' : 'Скачать в офлайн'}
@@ -217,6 +224,7 @@ export function PlayerBar({
           )}
 
           <button
+            type="button"
             onClick={() => onOpenDrawer('lyrics')}
             title="Текст песни"
             className="p-2 rounded-xl hover:bg-white/10 text-white/65 hover:text-violet-300 transition cursor-pointer"
@@ -225,6 +233,7 @@ export function PlayerBar({
           </button>
 
           <button
+            type="button"
             onClick={() => onOpenDrawer('eq')}
             title="Эквалайзер"
             className="p-2 rounded-xl hover:bg-white/10 text-white/65 hover:text-teal-300 transition cursor-pointer"
@@ -233,6 +242,7 @@ export function PlayerBar({
           </button>
 
           <button
+            type="button"
             onClick={() => onOpenDrawer('sleep')}
             title="Таймер сна"
             className={`p-2 rounded-xl hover:bg-white/10 transition cursor-pointer ${
@@ -244,6 +254,7 @@ export function PlayerBar({
 
           <div className="flex items-center gap-2 ml-2 pl-2 border-l border-white/10">
             <button
+              type="button"
               onClick={() => onVolumeChange(volume > 0 ? 0 : 1)}
               className="text-white/65 hover:text-white transition cursor-pointer"
             >
@@ -266,14 +277,14 @@ export function PlayerBar({
       {track && !mobileExpanded && (
         <div
           onClick={() => setMobileExpanded(true)}
-          className="md:hidden fixed bottom-16 inset-x-2 z-30 rounded-2xl bg-[#14141a]/95 backdrop-blur-2xl border border-white/15 p-2.5 shadow-2xl overflow-hidden cursor-pointer"
+          className="md:hidden fixed bottom-16 inset-x-2 z-40 rounded-2xl bg-[#14141a]/95 backdrop-blur-2xl border border-white/15 p-2.5 shadow-2xl overflow-hidden cursor-pointer"
         >
-          <div className="absolute top-0 left-0 right-0 h-0.5 bg-white/10">
+          <div className="absolute top-0 left-0 right-0 h-0.5 bg-white/10 pointer-events-none">
             <div className="h-full bg-teal-400 transition-all" style={{ width: `${progress}%` }} />
           </div>
 
           <div className="flex items-center justify-between gap-2.5">
-            <div className="flex items-center gap-2.5 min-w-0">
+            <div className="flex items-center gap-2.5 min-w-0 flex-1">
               <div className="w-10 h-10 rounded-xl overflow-hidden bg-white/10 shrink-0">
                 {track.thumbnail ? (
                   // eslint-disable-next-line @next/next/no-img-element
@@ -288,16 +299,22 @@ export function PlayerBar({
               </div>
             </div>
 
-            <div className="flex items-center gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+            <div
+              className="flex items-center gap-1 shrink-0 relative z-10"
+              onClick={(e) => e.stopPropagation()}
+              onTouchStart={(e) => e.stopPropagation()}
+            >
               <button
+                type="button"
                 onClick={onToggleLike}
-                className="p-2 text-white/70 hover:text-pink-400"
+                className="p-2 text-white/70 hover:text-pink-400 active:scale-90 transition"
               >
                 <Heart className={`w-4 h-4 ${isLiked ? 'fill-pink-400 text-pink-400' : ''}`} />
               </button>
               <button
+                type="button"
                 onClick={onTogglePlay}
-                className="w-9 h-9 rounded-full bg-white text-zinc-950 flex items-center justify-center"
+                className="w-10 h-10 rounded-full bg-white text-zinc-950 flex items-center justify-center active:scale-90 transition shadow"
               >
                 {isLoading ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
@@ -307,7 +324,11 @@ export function PlayerBar({
                   <Play className="w-4 h-4 fill-zinc-950 ml-0.5" />
                 )}
               </button>
-              <button onClick={onNext} className="p-2 text-white/75">
+              <button
+                type="button"
+                onClick={onNext}
+                className="p-2 text-white/75 active:scale-90 transition"
+              >
                 <SkipForward className="w-4 h-4" />
               </button>
             </div>
@@ -317,7 +338,7 @@ export function PlayerBar({
 
       {/* ==================== ПОЛНОЭКРАННЫЙ ПЛЕЕР ДЛЯ ТЕЛЕФОНА ==================== */}
       {track && mobileExpanded && (
-        <div className="md:hidden fixed inset-0 z-40 bg-[#09090b] flex flex-col justify-between p-6 overflow-y-auto">
+        <div className="md:hidden fixed inset-0 z-50 bg-[#09090b] flex flex-col justify-between p-6 overflow-y-auto">
           {track.thumbnail && (
             <div
               className="absolute inset-0 opacity-25 blur-3xl pointer-events-none"
@@ -331,6 +352,7 @@ export function PlayerBar({
 
           <div className="relative z-10 flex items-center justify-between">
             <button
+              type="button"
               onClick={() => setMobileExpanded(false)}
               className="p-2 rounded-full bg-white/10 text-white"
             >
@@ -338,6 +360,7 @@ export function PlayerBar({
             </button>
             <span className="text-xs uppercase tracking-widest text-white/60">Сейчас играет</span>
             <button
+              type="button"
               onClick={onAddToPlaylist}
               className="p-2 rounded-full bg-white/10 text-white"
             >
@@ -361,6 +384,7 @@ export function PlayerBar({
                 <p className="text-sm text-white/60 truncate">{track.artist}</p>
               </div>
               <button
+                type="button"
                 onClick={onToggleLike}
                 className="p-2.5 rounded-full bg-white/10 text-white shrink-0"
               >
@@ -390,6 +414,7 @@ export function PlayerBar({
 
             <div className="flex items-center justify-center gap-6">
               <button
+                type="button"
                 onClick={onToggleShuffle}
                 className={`p-3 rounded-full ${
                   isShuffled ? 'text-teal-300 bg-teal-500/20' : 'text-white/55'
@@ -397,12 +422,13 @@ export function PlayerBar({
               >
                 <Shuffle className="w-5 h-5" />
               </button>
-              <button onClick={onPrev} className="p-3 text-white/80">
+              <button type="button" onClick={onPrev} className="p-3 text-white/80">
                 <SkipBack className="w-7 h-7" />
               </button>
               <button
+                type="button"
                 onClick={onTogglePlay}
-                className="w-16 h-16 rounded-full bg-white text-zinc-950 flex items-center justify-center shadow-xl"
+                className="w-16 h-16 rounded-full bg-white text-zinc-950 flex items-center justify-center shadow-xl active:scale-95 transition"
               >
                 {isLoading ? (
                   <Loader2 className="w-7 h-7 animate-spin" />
@@ -412,13 +438,14 @@ export function PlayerBar({
                   <Play className="w-7 h-7 fill-zinc-950 ml-0.5" />
                 )}
               </button>
-              <button onClick={onNext} className="p-3 text-white/80">
+              <button type="button" onClick={onNext} className="p-3 text-white/80">
                 <SkipForward className="w-7 h-7" />
               </button>
             </div>
 
             <div className="grid grid-cols-4 gap-2 pt-2">
               <button
+                type="button"
                 onClick={() => onOpenDrawer('lyrics')}
                 className="flex flex-col items-center gap-1 py-2.5 rounded-2xl bg-white/[0.07] text-[11px] text-white/80"
               >
@@ -426,6 +453,7 @@ export function PlayerBar({
                 <span>Текст</span>
               </button>
               <button
+                type="button"
                 onClick={() => onOpenDrawer('eq')}
                 className="flex flex-col items-center gap-1 py-2.5 rounded-2xl bg-white/[0.07] text-[11px] text-white/80"
               >
@@ -433,6 +461,7 @@ export function PlayerBar({
                 <span>EQ</span>
               </button>
               <button
+                type="button"
                 onClick={() => onOpenDrawer('sleep')}
                 className="flex flex-col items-center gap-1 py-2.5 rounded-2xl bg-white/[0.07] text-[11px] text-white/80"
               >
@@ -440,6 +469,7 @@ export function PlayerBar({
                 <span>Таймер</span>
               </button>
               <button
+                type="button"
                 onClick={onDownload}
                 disabled={isDownloading || isSaved}
                 className="flex flex-col items-center gap-1 py-2.5 rounded-2xl bg-white/[0.07] text-[11px] text-white/80"

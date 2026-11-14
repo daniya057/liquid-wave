@@ -3,7 +3,13 @@ import { NextRequest, NextResponse } from 'next/server';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const streamUrlCache = new Map<string, { url: string; mimeType: string; expiresAt: number }>();
+interface AudioSource {
+  url: string;
+  mimeType: string;
+  isHls?: boolean;
+}
+
+const streamUrlCache = new Map<string, AudioSource & { expiresAt: number }>();
 let cachedScClientId: { id: string; expiresAt: number } | null = null;
 
 function safeDecode(value: string): string {
@@ -28,7 +34,7 @@ async function getSoundCloudClientId(): Promise<string> {
   const html = await pageRes.text();
   const scriptUrls = [...html.matchAll(/<script[^>]+src="(https:\/\/a-v2\.sndcdn\.com\/assets\/[^"]+\.js)"/g)]
     .map((m) => m[1])
-    .slice(-5);
+    .slice(-6);
 
   for (const scriptUrl of scriptUrls.reverse()) {
     try {
@@ -45,20 +51,27 @@ async function getSoundCloudClientId(): Promise<string> {
         return match[1];
       }
     } catch {
-      // проверяем следующий бандл
+      // проверяем следующий скрипт
     }
   }
 
   throw new Error('SoundCloud client_id not found');
 }
 
-async function fetchFromSoundCloudQuery(query: string): Promise<{ url: string; mimeType: string }> {
+function isFullTranscoding(t: any): boolean {
+  if (!t?.url || typeof t.url !== 'string') return false;
+  if (t.snipped === true) return false;
+  if (t.url.includes('/preview/')) return false;
+  return true;
+}
+
+async function fetchFromSoundCloudQuery(query: string): Promise<AudioSource> {
   const clientId = await getSoundCloudClientId();
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5000);
+  const timer = setTimeout(() => controller.abort(), 5500);
 
   try {
-    const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=8`;
+    const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=10`;
     const res = await fetch(searchUrl, {
       signal: controller.signal,
       headers: {
@@ -71,17 +84,18 @@ async function fetchFromSoundCloudQuery(query: string): Promise<{ url: string; m
     const data = await res.json();
     const items: any[] = Array.isArray(data?.collection) ? data.collection : [];
 
-    const candidates = items
-      .filter((item) => Array.isArray(item?.media?.transcodings))
-      .sort((a, b) => {
-        const aFull = a.policy !== 'SNIP' && (a.duration || 0) > 45000 ? 1 : 0;
-        const bFull = b.policy !== 'SNIP' && (b.duration || 0) > 45000 ? 1 : 0;
-        return bFull - aFull;
-      });
+    // Берём только полноценные треки длиннее 45 секунд
+    const fullTracks = items.filter(
+      (item) =>
+        Array.isArray(item?.media?.transcodings) &&
+        (item.duration || 0) >= 45000 &&
+        item.policy !== 'BLOCK'
+    );
 
-    for (const track of candidates) {
+    // 1. Сначала ищем прямой полный progressive MP3 (без /preview/)
+    for (const track of fullTracks) {
       const progressive = track.media.transcodings.find(
-        (t: any) => t?.format?.protocol === 'progressive' && t?.url
+        (t: any) => isFullTranscoding(t) && t?.format?.protocol === 'progressive'
       );
       if (!progressive) continue;
 
@@ -91,15 +105,38 @@ async function fetchFromSoundCloudQuery(query: string): Promise<{ url: string; m
       if (!streamInfoRes.ok) continue;
 
       const streamInfo = await streamInfoRes.json();
-      if (streamInfo?.url) {
+      if (streamInfo?.url && !streamInfo.url.includes('/preview/')) {
         return {
           url: streamInfo.url,
           mimeType: 'audio/mpeg',
+          isHls: false,
         };
       }
     }
 
-    throw new Error('No progressive MP3 stream on SoundCloud');
+    // 2. Если прямого MP3 нет — берём полный HLS-поток (на iPhone играет нативно без лимита 30 сек)
+    for (const track of fullTracks) {
+      const hls = track.media.transcodings.find(
+        (t: any) => isFullTranscoding(t) && t?.format?.protocol === 'hls'
+      );
+      if (!hls) continue;
+
+      const streamInfoRes = await fetch(`${hls.url}?client_id=${clientId}`, {
+        signal: controller.signal,
+      });
+      if (!streamInfoRes.ok) continue;
+
+      const streamInfo = await streamInfoRes.json();
+      if (streamInfo?.url && !streamInfo.url.includes('/preview/')) {
+        return {
+          url: streamInfo.url,
+          mimeType: 'application/vnd.apple.mpegurl',
+          isHls: true,
+        };
+      }
+    }
+
+    throw new Error('No full-length stream on SoundCloud');
   } finally {
     clearTimeout(timer);
   }
@@ -126,7 +163,7 @@ async function fetchYoutubeTitleOEmbed(videoId: string): Promise<string> {
   }
 }
 
-async function fetchFromSoundCloudByVideoId(videoId: string): Promise<{ url: string; mimeType: string }> {
+async function fetchFromSoundCloudByVideoId(videoId: string): Promise<AudioSource> {
   const title = await fetchYoutubeTitleOEmbed(videoId);
   return fetchFromSoundCloudQuery(title);
 }
@@ -137,7 +174,7 @@ async function fetchInnerTubeMp4(
   clientVersion: string,
   ua: string,
   extraClient: Record<string, any> = {}
-): Promise<{ url: string; mimeType: string }> {
+): Promise<AudioSource> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 4000);
   try {
@@ -183,19 +220,20 @@ async function fetchInnerTubeMp4(
     return {
       url: mp4Audio[0].url,
       mimeType: 'audio/mp4',
+      isHls: false,
     };
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function getAudioSource(rawId: string): Promise<{ url: string; mimeType: string }> {
+async function getAudioSource(rawId: string): Promise<AudioSource> {
   const cached = streamUrlCache.get(rawId);
   if (cached && cached.expiresAt > Date.now()) {
-    return { url: cached.url, mimeType: cached.mimeType };
+    return { url: cached.url, mimeType: cached.mimeType, isHls: cached.isHls };
   }
 
-  let resolved: { url: string; mimeType: string };
+  let resolved: AudioSource;
 
   if (rawId.startsWith('ytq:')) {
     const query = safeDecode(rawId.split(':').slice(2).join(':')).trim();
@@ -224,10 +262,84 @@ async function getAudioSource(rawId: string): Promise<{ url: string; mimeType: s
   streamUrlCache.set(rawId, {
     url: resolved.url,
     mimeType: resolved.mimeType,
+    isHls: resolved.isHls,
     expiresAt: Date.now() + 1000 * 60 * 60,
   });
 
   return resolved;
+}
+
+async function handleHlsStream(req: NextRequest, m3u8Url: string, isHead: boolean) {
+  const m3u8Res = await fetch(m3u8Url);
+  if (!m3u8Res.ok) {
+    return NextResponse.json({ error: 'Failed to load HLS playlist' }, { status: 502 });
+  }
+
+  const m3u8Text = await m3u8Res.text();
+  const ua = req.headers.get('user-agent') || '';
+  const isAppleSafari = /iPhone|iPad|iPod|Macintosh/i.test(ua) && !/Chrome|CriOS|Edg/i.test(ua);
+
+  // iPhone / Safari декодирует .m3u8 нативно в <audio> с перемоткой и фоном
+  if (isAppleSafari) {
+    return new NextResponse(isHead ? null : m3u8Text, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/vnd.apple.mpegurl',
+        'Cache-Control': 'no-store',
+      },
+    });
+  }
+
+  // Для Chrome / Windows склеиваем сегменты в непрерывный MP3-поток
+  const segmentUrls = m3u8Text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('http'));
+
+  if (segmentUrls.length === 0) {
+    return NextResponse.json({ error: 'Empty HLS segments' }, { status: 502 });
+  }
+
+  if (isHead) {
+    return new NextResponse(null, {
+      status: 200,
+      headers: {
+        'Content-Type': 'audio/mpeg',
+        'Cache-Control': 'no-store',
+      },
+    });
+  }
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      try {
+        for (const segUrl of segmentUrls) {
+          if (req.signal.aborted) break;
+          const segRes = await fetch(segUrl, { signal: req.signal });
+          if (!segRes.ok || !segRes.body) continue;
+          const reader = segRes.body.getReader();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) controller.enqueue(value);
+          }
+        }
+        controller.close();
+      } catch {
+        try {
+          controller.close();
+        } catch {}
+      }
+    },
+  });
+
+  return new NextResponse(stream, {
+    status: 200,
+    headers: {
+      'Content-Type': 'audio/mpeg',
+      'Cache-Control': 'no-store',
+    },
+  });
 }
 
 async function handleStream(
@@ -248,6 +360,10 @@ async function handleStream(
       return NextResponse.json({ ok: true });
     }
 
+    if (source.isHls) {
+      return handleHlsStream(req, source.url, isHead);
+    }
+
     const rangeHeader = req.headers.get('range');
     const upstreamHeaders: Record<string, string> = {
       'User-Agent':
@@ -265,6 +381,9 @@ async function handleStream(
     if (upstream.status === 403 || upstream.status === 410) {
       streamUrlCache.delete(rawId);
       const fresh = await getAudioSource(rawId);
+      if (fresh.isHls) {
+        return handleHlsStream(req, fresh.url, isHead);
+      }
       upstream = await fetch(fresh.url, {
         method: isHead ? 'HEAD' : 'GET',
         headers: upstreamHeaders,

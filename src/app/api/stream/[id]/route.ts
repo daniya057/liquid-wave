@@ -71,7 +71,6 @@ async function fetchFromSoundCloudQuery(query: string): Promise<{ url: string; m
     const data = await res.json();
     const items: any[] = Array.isArray(data?.collection) ? data.collection : [];
 
-    // Выбираем полные треки (не 30-секундные SNIP-превью) с прямым progressive MP3
     const candidates = items
       .filter((item) => Array.isArray(item?.media?.transcodings))
       .sort((a, b) => {
@@ -171,7 +170,6 @@ async function fetchInnerTubeMp4(
       ...(data?.streamingData?.formats || []),
     ];
 
-    // Строго audio/mp4 (m4a), чтобы iPhone Safari гарантированно декодировал звук
     const mp4Audio = formats
       .filter(
         (f: any) =>
@@ -236,3 +234,80 @@ async function handleStream(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> },
   isHead: boolean
+) {
+  try {
+    const { id } = await params;
+    const rawId = safeDecode(id || '').trim();
+    if (!rawId) {
+      return NextResponse.json({ error: 'Missing track id' }, { status: 400 });
+    }
+
+    const source = await getAudioSource(rawId);
+
+    if (req.nextUrl.searchParams.get('prefetch') === '1') {
+      return NextResponse.json({ ok: true });
+    }
+
+    const rangeHeader = req.headers.get('range');
+    const upstreamHeaders: Record<string, string> = {
+      'User-Agent':
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1',
+    };
+    if (rangeHeader) {
+      upstreamHeaders['Range'] = rangeHeader;
+    }
+
+    let upstream = await fetch(source.url, {
+      method: isHead ? 'HEAD' : 'GET',
+      headers: upstreamHeaders,
+    });
+
+    if (upstream.status === 403 || upstream.status === 410) {
+      streamUrlCache.delete(rawId);
+      const fresh = await getAudioSource(rawId);
+      upstream = await fetch(fresh.url, {
+        method: isHead ? 'HEAD' : 'GET',
+        headers: upstreamHeaders,
+      });
+    }
+
+    if (!upstream.ok && upstream.status !== 206) {
+      return NextResponse.json({ error: 'Upstream stream failed' }, { status: 502 });
+    }
+
+    const responseHeaders = new Headers();
+    responseHeaders.set('Content-Type', upstream.headers.get('content-type') || source.mimeType);
+    responseHeaders.set('Accept-Ranges', 'bytes');
+    responseHeaders.set('Cache-Control', 'no-store');
+
+    const contentLength = upstream.headers.get('content-length');
+    if (contentLength) responseHeaders.set('Content-Length', contentLength);
+
+    const contentRange = upstream.headers.get('content-range');
+    if (contentRange) responseHeaders.set('Content-Range', contentRange);
+
+    return new NextResponse(isHead ? null : upstream.body, {
+      status: upstream.status,
+      headers: responseHeaders,
+    });
+  } catch (err: any) {
+    return NextResponse.json(
+      { error: err?.message || 'Failed to stream audio' },
+      { status: 500 }
+    );
+  }
+}
+
+export async function GET(
+  req: NextRequest,
+  context: { params: Promise<{ id: string }> }
+) {
+  return handleStream(req, context, false);
+}
+
+export async function HEAD(
+  req: NextRequest,
+  context: { params: Promise<{ id: string }> }
+) {
+  return handleStream(req, context, true);
+}

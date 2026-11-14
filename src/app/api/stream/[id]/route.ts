@@ -25,18 +25,23 @@ function getYtDlpPath(): string {
   return 'yt-dlp';
 }
 
-// Если в Render добавлена переменная YOUTUBE_COOKIES, сохраняем её во временный файл
 function getCookiesFilePath(): string | null {
-  const cookiesContent = process.env.YOUTUBE_COOKIES?.trim();
-  if (!cookiesContent) return null;
+  const raw = process.env.YOUTUBE_COOKIES?.trim();
+  if (!raw) {
+    console.warn('[STREAM] Переменная YOUTUBE_COOKIES пустая!');
+    return null;
+  }
 
   const tmpPath = path.join('/tmp', 'yt_cookies.txt');
   try {
-    if (!fs.existsSync(tmpPath)) {
-      fs.writeFileSync(tmpPath, cookiesContent, 'utf-8');
-    }
+    const content = raw.startsWith('#')
+      ? raw
+      : Buffer.from(raw, 'base64').toString('utf-8');
+
+    fs.writeFileSync(tmpPath, content, 'utf-8');
     return tmpPath;
-  } catch {
+  } catch (e) {
+    console.error('[STREAM] Ошибка записи куки:', e);
     return null;
   }
 }
@@ -57,7 +62,7 @@ async function resolveWithYtDlp(videoId: string): Promise<string> {
     '--no-check-certificates',
     '--geo-bypass',
     '--extractor-args',
-    'youtube:player_client=tv_embedded,mweb,ios',
+    'youtube:player_client=web,mweb',
   ];
 
   if (cookiesPath) {
@@ -66,18 +71,22 @@ async function resolveWithYtDlp(videoId: string): Promise<string> {
 
   args.push(videoUrl);
 
-  const { stdout } = await execFileAsync(ytDlpPath, args, { timeout: 15000 });
-  const directUrl = stdout.trim().split('\n')[0];
+  try {
+    const { stdout } = await execFileAsync(ytDlpPath, args, { timeout: 15000 });
+    const directUrl = stdout.trim().split('\n')[0];
 
-  if (!directUrl || !directUrl.startsWith('http')) {
-    throw new Error('Не удалось получить ссылку на аудио через yt-dlp');
+    if (!directUrl || !directUrl.startsWith('http')) {
+      throw new Error('Пустой ответ от yt-dlp');
+    }
+
+    console.log(`[STREAM] yt-dlp получил ссылку для ${videoId} за ${Date.now() - start}ms`);
+    return directUrl;
+  } catch (err: any) {
+    console.error(`[STREAM] Детали ошибки yt-dlp для ${videoId}:`, err.stderr || err.message);
+    throw err;
   }
-
-  console.log(`[STREAM] yt-dlp получил ссылку для ${videoId} за ${Date.now() - start}ms`);
-  return directUrl;
 }
 
-// Запасной вариант через зеркала, если YouTube заблокировал IP сервера Render
 async function resolveWithFallbackMirrors(videoId: string): Promise<string> {
   const start = Date.now();
 
@@ -108,7 +117,7 @@ async function resolveWithFallbackMirrors(videoId: string): Promise<string> {
 async function resolveAudioUrl(videoId: string): Promise<string> {
   try {
     return await resolveWithYtDlp(videoId);
-  } catch (err: any) {
+  } catch {
     console.warn(`[STREAM] yt-dlp не прошёл для ${videoId}, пробую резервный канал...`);
     return await resolveWithFallbackMirrors(videoId);
   }

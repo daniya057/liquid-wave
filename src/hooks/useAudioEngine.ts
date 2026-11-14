@@ -138,7 +138,7 @@ export function useAudioEngine(onEnded?: () => void) {
       }
     };
 
-    const handlePlay = () => {
+    const handlePlaying = () => {
       setIsPlaying(true);
       setIsLoading(false);
       if (
@@ -156,14 +156,13 @@ export function useAudioEngine(onEnded?: () => void) {
     };
 
     const handleWaiting = () => {
-      setIsLoading(true);
+      if (shouldPlayRef.current) {
+        setIsLoading(true);
+      }
     };
 
     const handleCanPlay = () => {
       setIsLoading(false);
-      if (shouldPlayRef.current && audio.paused && !audio.ended) {
-        audio.play().catch(() => {});
-      }
     };
 
     const handleTimeUpdate = () => {
@@ -187,6 +186,7 @@ export function useAudioEngine(onEnded?: () => void) {
     };
 
     const handleEnded = () => {
+      shouldPlayRef.current = false;
       setIsPlaying(false);
       if (onEndedRef.current) {
         onEndedRef.current();
@@ -199,11 +199,10 @@ export function useAudioEngine(onEnded?: () => void) {
       setIsPlaying(false);
     };
 
-    audio.addEventListener('play', handlePlay);
+    audio.addEventListener('playing', handlePlaying);
     audio.addEventListener('pause', handlePause);
     audio.addEventListener('waiting', handleWaiting);
     audio.addEventListener('canplay', handleCanPlay);
-    audio.addEventListener('playing', handleCanPlay);
     audio.addEventListener('timeupdate', handleTimeUpdate);
     audio.addEventListener('loadedmetadata', handleLoadedMetadata);
     audio.addEventListener('durationchange', handleLoadedMetadata);
@@ -211,11 +210,10 @@ export function useAudioEngine(onEnded?: () => void) {
     audio.addEventListener('error', handleError);
 
     return () => {
-      audio.removeEventListener('play', handlePlay);
+      audio.removeEventListener('playing', handlePlaying);
       audio.removeEventListener('pause', handlePause);
       audio.removeEventListener('waiting', handleWaiting);
       audio.removeEventListener('canplay', handleCanPlay);
-      audio.removeEventListener('playing', handleCanPlay);
       audio.removeEventListener('timeupdate', handleTimeUpdate);
       audio.removeEventListener('loadedmetadata', handleLoadedMetadata);
       audio.removeEventListener('durationchange', handleLoadedMetadata);
@@ -237,7 +235,9 @@ export function useAudioEngine(onEnded?: () => void) {
       setCurrentTime(0);
       setDuration(0);
 
+      audio.pause();
       audio.src = src;
+      audio.load();
 
       try {
         await audio.play();
@@ -263,6 +263,7 @@ export function useAudioEngine(onEnded?: () => void) {
     if (audio.paused || audio.ended || audio.error) {
       if (audio.error || audio.readyState === 0 || !audio.src) {
         audio.src = src;
+        audio.load();
       }
       shouldPlayRef.current = true;
       setIsLoading(true);

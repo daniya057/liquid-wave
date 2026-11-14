@@ -137,7 +137,8 @@ export function useAudioEngine(onEndedOrOptions?: any) {
       audioRef.current.removeAttribute('src');
     }
 
-    let cleanId = rawUrl.replace('/api/stream/', '').split('?')[0];
+    const [pathPart, queryPart] = rawUrl.split('?');
+    let cleanId = pathPart.replace('/api/stream/', '');
     try {
       cleanId = decodeURIComponent(cleanId);
     } catch {}
@@ -148,22 +149,21 @@ export function useAudioEngine(onEndedOrOptions?: any) {
         cleanId = cached;
       } else {
         try {
-          const encodedQuery = cleanId.split(':').slice(2).join(':');
-          const res = await fetch(`/api/search?q=${encodedQuery}`);
+          const resolveUrl = `/api/stream/${encodeURIComponent(cleanId)}?resolve=1${queryPart ? `&${queryPart}` : ''}`;
+          const res = await fetch(resolveUrl);
           const data = await res.json();
-          const bestId = data?.tracks?.[0]?.id;
-          if (!bestId) {
+          if (!data?.videoId) {
             setIsLoading(false);
             setIsPlaying(false);
-            setError('Трек не найден');
+            setError('Оригинал трека не найден');
             return;
           }
-          resolvedYtqCache.set(cleanId, bestId);
-          cleanId = bestId;
+          resolvedYtqCache.set(cleanId, data.videoId);
+          cleanId = data.videoId;
         } catch {
           setIsLoading(false);
           setIsPlaying(false);
-          setError('Ошибка поиска трека');
+          setError('Ошибка поиска оригинала');
           return;
         }
       }
@@ -187,12 +187,15 @@ export function useAudioEngine(onEndedOrOptions?: any) {
       if (!input) return;
       configureIosAudioSession();
 
-      const url =
-        typeof input === 'string'
-          ? input
-          : input.id.startsWith('blob:') || input.id.startsWith('/') || input.id.startsWith('http')
-            ? input.id
-            : `/api/stream/${encodeURIComponent(input.id)}`;
+      let url = '';
+      if (typeof input === 'string') {
+        url = input;
+      } else if (input.id.startsWith('blob:') || input.id.startsWith('/') || input.id.startsWith('http')) {
+        url = input.id;
+      } else {
+        const durParam = input.duration && input.duration > 0 ? `?d=${Math.round(input.duration)}` : '';
+        url = `/api/stream/${encodeURIComponent(input.id)}${durParam}`;
+      }
 
       lastUrlRef.current = url;
       maxReachedTimeRef.current = 0;
@@ -220,7 +223,7 @@ export function useAudioEngine(onEndedOrOptions?: any) {
           if (modeRef.current === 'native' && el.paused) {
             startYoutubeFallback(url);
           }
-        }, 10000);
+        }, 9000);
       }
 
       el.src = url;

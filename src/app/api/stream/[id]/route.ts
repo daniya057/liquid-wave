@@ -12,23 +12,13 @@ interface AudioSource {
 const streamUrlCache = new Map<string, AudioSource & { expiresAt: number }>();
 const resolvedVideoIdCache = new Map<string, { videoId: string; expiresAt: number }>();
 let cachedScClientId: { id: string; expiresAt: number } | null = null;
-
-const PIPED_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
-  'https://pipedapi.adminforge.de',
-  'https://api.piped.private.coffee',
-  'https://pipedapi.drgns.space',
-];
-
-const INVIDIOUS_INSTANCES = [
-  'https://inv.nadeko.net',
-  'https://invidious.nerdvpn.de',
-  'https://yt.artemislena.eu',
-];
+let cachedYtVisitor: { visitorData: string; sts: number; expiresAt: number } | null = null;
 
 const UNWANTED_MODIFIERS = [
   'remix',
   'rmx',
+  'edit',
+  'vip',
   'flip',
   'bootleg',
   'mashup',
@@ -94,70 +84,98 @@ function cleanTrackQuery(raw: string): string {
 
 function parseDurationSec(text?: string): number {
   if (!text) return 0;
-  const parts = text.split(':').map(Number);
+  const parts = text.trim().split(':').map(Number);
   if (parts.some(isNaN)) return 0;
   if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
   if (parts.length === 2) return parts[0] * 60 + parts[1];
   return parts[0] || 0;
 }
 
-function scoreYoutubeCandidate(
-  video: { videoId: string; title: string; channel: string; durationSec: number; snippet: string },
-  cleanQuery: string
-): number {
-  const queryLower = cleanQuery.toLowerCase();
-  const titleLower = video.title.toLowerCase();
-  const channelLower = video.channel.toLowerCase();
-  const snippetLower = video.snippet.toLowerCase();
-
-  let score = 0;
-
-  if (channelLower.endsWith('- topic') || snippetLower.includes('provided to youtube')) {
-    score += 170;
-  } else if (channelLower.includes('vevo') || channelLower.includes('official')) {
-    score += 80;
-  }
-
-  if (titleLower.includes('official audio') || titleLower.includes('audio')) {
-    score += 45;
-  }
-
-  for (const mod of UNWANTED_MODIFIERS) {
-    if (!queryLower.includes(mod)) {
-      if (titleLower.includes(mod)) {
-        score -= 220;
-      } else if (channelLower.includes(mod) || snippetLower.includes(mod)) {
-        score -= 90;
-      }
-    }
-  }
-
-  if (video.durationSec > 0) {
-    if (video.durationSec < 45 || video.durationSec > 600) {
-      score -= 150;
-    } else if (video.durationSec >= 90 && video.durationSec <= 420) {
-      score += 20;
-    }
-  }
-
-  const queryTokens = queryLower
-    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-    .split(/\s+/)
-    .filter((w) => w.length > 1);
-
-  let matched = 0;
-  const haystack = `${titleLower} ${channelLower}`;
-  for (const token of queryTokens) {
-    if (haystack.includes(token)) matched += 1;
-  }
-  if (queryTokens.length > 0) {
-    score += Math.round((matched / queryTokens.length) * 100);
-  }
-
-  return score;
+function hasUnwantedVariant(text: string, allowedQuery: string): boolean {
+  const qLower = allowedQuery.toLowerCase();
+  const tLower = text.toLowerCase();
+  return UNWANTED_MODIFIERS.some((mod) => !qLower.includes(mod) && tLower.includes(mod));
 }
 
-async function searchYoutubeCandidates(query: string) {
+async function searchYoutubeMusicSongs(query: string) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4500);
+  try {
+    const res = await fetch('https://music.youtube.com/youtubei/v1/search?prettyPrint=false', {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        Origin: 'https://music.youtube.com',
+        Referer: 'https://music.youtube.com/',
+      },
+      body: JSON.stringify({
+        context: {
+          client: {
+            clientName: 'WEB_REMIX',
+            clientVersion: '1.20241127.01.00',
+            hl: 'en',
+            gl: 'US',
+          },
+        },
+        query,
+        // Фильтр "Songs" в YouTube Music — возвращает только официальные студийные треки
+        params: 'EgWKAQIIAWoKEAMQBBAJEAoQBQ%3D%3D',
+      }),
+    });
+    if (!res.ok) return [];
+    const json = await res.json();
+
+    const tabs = json?.contents?.tabbedSearchResultsRenderer?.tabs || [];
+    const sections =
+      tabs[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [];
+
+    const results: { videoId: string; title: string; channel: string; durationSec: number; isYtmSong: boolean }[] = [];
+
+    for (const sec of sections) {
+      const shelfItems = sec?.musicShelfRenderer?.contents || [];
+      for (const item of shelfItems) {
+        const renderer = item?.musicResponsiveListItemRenderer;
+        if (!renderer) continue;
+
+        const videoId =
+          renderer?.playlistItemData?.videoId ||
+          renderer?.overlay?.musicItemThumbnailOverlayRenderer?.content?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId;
+        if (!videoId) continue;
+
+        const flexCols = renderer?.flexColumns || [];
+        const title =
+          flexCols[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs
+            ?.map((r: any) => r.text)
+            .join('') || '';
+
+        const metaRuns =
+          flexCols[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+        const metaTexts = metaRuns.map((r: any) => String(r.text || '').trim());
+        const artist = metaTexts[0] || '';
+        const durationText = [...metaTexts].reverse().find((t) => /^\d+:\d{2}(:\d{2})?$/.test(t));
+        const durationSec = parseDurationSec(durationText);
+
+        results.push({
+          videoId,
+          title,
+          channel: artist,
+          durationSec,
+          isYtmSong: true,
+        });
+      }
+    }
+    return results;
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function searchYoutubeTopicFallback(query: string) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 4500);
   try {
@@ -178,7 +196,7 @@ async function searchYoutubeCandidates(query: string) {
             gl: 'US',
           },
         },
-        query,
+        query: `${query} "Topic"`,
       }),
     });
     if (!res.ok) return [];
@@ -186,7 +204,7 @@ async function searchYoutubeCandidates(query: string) {
     const sections =
       json?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents || [];
 
-    const results: { videoId: string; title: string; channel: string; durationSec: number; snippet: string }[] = [];
+    const results: { videoId: string; title: string; channel: string; durationSec: number; isYtmSong: boolean }[] = [];
     for (const sec of sections) {
       for (const item of sec?.itemSectionRenderer?.contents || []) {
         const v = item?.videoRenderer;
@@ -194,9 +212,13 @@ async function searchYoutubeCandidates(query: string) {
         const title = v.title?.runs?.map((r: any) => r.text).join('') || '';
         const channel = v.ownerText?.runs?.map((r: any) => r.text).join('') || '';
         const durationSec = parseDurationSec(v.lengthText?.simpleText);
-        const snippet =
-          v.detailedMetadataSnippets?.[0]?.snippetText?.runs?.map((r: any) => r.text).join('') || '';
-        results.push({ videoId: v.videoId, title, channel, durationSec, snippet });
+        results.push({
+          videoId: v.videoId,
+          title,
+          channel,
+          durationSec,
+          isYtmSong: channel.toLowerCase().endsWith('- topic'),
+        });
       }
     }
     return results;
@@ -207,34 +229,69 @@ async function searchYoutubeCandidates(query: string) {
   }
 }
 
-async function resolveYtqToOfficialVideoId(rawQuery: string): Promise<string> {
+async function resolveYtqToOfficialVideoId(rawQuery: string, expectedDurationSec = 0): Promise<string> {
   const cleanQuery = cleanTrackQuery(rawQuery) || rawQuery;
-  const cacheKey = cleanQuery.toLowerCase();
+  const cacheKey = `${cleanQuery.toLowerCase()}:${expectedDurationSec}`;
 
   const cached = resolvedVideoIdCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
     return cached.videoId;
   }
 
-  const [directList, topicList] = await Promise.all([
-    searchYoutubeCandidates(cleanQuery),
-    searchYoutubeCandidates(`${cleanQuery} topic`),
+  const [ytmSongs, topicVideos] = await Promise.all([
+    searchYoutubeMusicSongs(cleanQuery),
+    searchYoutubeTopicFallback(cleanQuery),
   ]);
 
-  const uniqueMap = new Map<string, { videoId: string; title: string; channel: string; durationSec: number; snippet: string }>();
-  for (const item of [...topicList, ...directList]) {
+  const uniqueMap = new Map<
+    string,
+    { videoId: string; title: string; channel: string; durationSec: number; isYtmSong: boolean }
+  >();
+  for (const item of [...ytmSongs, ...topicVideos]) {
     if (!uniqueMap.has(item.videoId)) {
       uniqueMap.set(item.videoId, item);
     }
   }
 
+  const queryTokens = cleanQuery
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length > 1);
+
   const ranked = Array.from(uniqueMap.values())
-    .map((item) => ({ item, score: scoreYoutubeCandidate(item, cleanQuery) }))
+    .map((item) => {
+      let score = 0;
+      if (item.isYtmSong) score += 220;
+      if (hasUnwantedVariant(`${item.title} ${item.channel}`, cleanQuery)) {
+        score -= 450;
+      }
+
+      if (expectedDurationSec > 0 && item.durationSec > 0) {
+        const diff = Math.abs(item.durationSec - expectedDurationSec);
+        if (diff <= 3) score += 250;
+        else if (diff <= 7) score += 140;
+        else if (diff > 15) score -= 350;
+      } else if (item.durationSec > 0 && (item.durationSec < 45 || item.durationSec > 600)) {
+        score -= 200;
+      }
+
+      const haystack = `${item.title} ${item.channel}`.toLowerCase();
+      let matched = 0;
+      for (const token of queryTokens) {
+        if (haystack.includes(token)) matched += 1;
+      }
+      if (queryTokens.length > 0) {
+        score += Math.round((matched / queryTokens.length) * 120);
+      }
+
+      return { item, score };
+    })
     .sort((a, b) => b.score - a.score);
 
   const bestId = ranked[0]?.item?.videoId;
   if (!bestId) {
-    throw new Error('Original studio track not found on YouTube');
+    throw new Error('Original studio track not found');
   }
 
   resolvedVideoIdCache.set(cacheKey, {
@@ -245,49 +302,148 @@ async function resolveYtqToOfficialVideoId(rawQuery: string): Promise<string> {
   return bestId;
 }
 
-function scoreSoundCloudCandidate(item: any, cleanQuery: string): number {
-  const queryLower = cleanQuery.toLowerCase();
-  const titleLower = String(item?.title || '').toLowerCase();
-  const userLower = String(item?.user?.username || '').toLowerCase();
-  const tagsLower = String(item?.tag_list || '').toLowerCase();
-  const combined = `${titleLower} ${tagsLower}`;
+async function getYoutubeVisitorContext(videoId: string): Promise<{ visitorData: string; sts: number }> {
+  if (cachedYtVisitor && cachedYtVisitor.expiresAt > Date.now()) {
+    return { visitorData: cachedYtVisitor.visitorData, sts: cachedYtVisitor.sts };
+  }
 
-  let score = 0;
-  if (item?.user?.verified) score += 35;
+  try {
+    const res = await fetch(`https://www.youtube.com/embed/${videoId}`, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      },
+      signal: AbortSignal.timeout(3500),
+    });
+    const html = await res.text();
+    const visitorMatch = html.match(/"visitorData"\s*:\s*"([^"]+)"/);
+    const stsMatch = html.match(/"sts"\s*:\s*(\d+)/);
 
-  for (const mod of UNWANTED_MODIFIERS) {
-    if (!queryLower.includes(mod)) {
-      if (titleLower.includes(mod)) {
-        score -= 180;
-      } else if (tagsLower.includes(mod) || userLower.includes(mod)) {
-        score -= 70;
-      }
+    if (visitorMatch?.[1]) {
+      cachedYtVisitor = {
+        visitorData: visitorMatch[1],
+        sts: stsMatch?.[1] ? Number(stsMatch[1]) : 20042,
+        expiresAt: Date.now() + 1000 * 60 * 25,
+      };
+      return { visitorData: cachedYtVisitor.visitorData, sts: cachedYtVisitor.sts };
     }
+  } catch {
+    // игнорируем
   }
 
-  const durationSec = (item?.duration || 0) / 1000;
-  if (durationSec > 480) {
-    score -= 100;
-  } else if (durationSec >= 110 && durationSec <= 360) {
-    score += 15;
-  }
+  return { visitorData: '', sts: 20042 };
+}
 
-  const queryTokens = queryLower
-    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-    .split(/\s+/)
-    .filter((w) => w.length > 2);
+async function fetchInnerTubeMp4(
+  videoId: string,
+  clientName: string,
+  clientVersion: string,
+  ua: string,
+  visitorData: string,
+  extraClient: Record<string, any> = {},
+  extraContext: Record<string, any> = {},
+  sts?: number
+): Promise<AudioSource> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4500);
+  try {
+    const body: any = {
+      videoId,
+      context: {
+        client: {
+          clientName,
+          clientVersion,
+          hl: 'en',
+          gl: 'US',
+          ...(visitorData ? { visitorData } : {}),
+          ...extraClient,
+        },
+        ...extraContext,
+      },
+      contentCheckOk: true,
+      racyCheckOk: true,
+    };
 
-  let matchedTokens = 0;
-  for (const token of queryTokens) {
-    if (combined.includes(token) || userLower.includes(token)) {
-      matchedTokens += 1;
+    if (sts) {
+      body.playbackContext = {
+        contentPlaybackContext: {
+          signatureTimestamp: sts,
+        },
+      };
     }
-  }
-  if (queryTokens.length > 0) {
-    score += Math.round((matchedTokens / queryTokens.length) * 60);
-  }
 
-  return score;
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'User-Agent': ua,
+    };
+    if (visitorData) {
+      headers['X-Goog-Visitor-Id'] = visitorData;
+    }
+
+    const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+      method: 'POST',
+      signal: controller.signal,
+      headers,
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error('InnerTube HTTP ' + res.status);
+    const data = await res.json();
+    const formats = [
+      ...(data?.streamingData?.adaptiveFormats || []),
+      ...(data?.streamingData?.formats || []),
+    ];
+
+    const mp4Audio = formats
+      .filter(
+        (f: any) =>
+          f.url &&
+          typeof f.mimeType === 'string' &&
+          f.mimeType.toLowerCase().includes('audio/mp4')
+      )
+      .sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0));
+
+    if (!mp4Audio[0]?.url) throw new Error('No audio/mp4 format');
+    return {
+      url: mp4Audio[0].url,
+      mimeType: 'audio/mp4',
+      isHls: false,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchExactYoutubeStream(videoId: string): Promise<AudioSource> {
+  const { visitorData, sts } = await getYoutubeVisitorContext(videoId);
+
+  return Promise.any([
+    fetchInnerTubeMp4(
+      videoId,
+      'IOS',
+      '19.45.4',
+      'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
+      visitorData,
+      { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' }
+    ),
+    fetchInnerTubeMp4(
+      videoId,
+      'ANDROID_VR',
+      '1.60.19',
+      'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+      visitorData,
+      { deviceMake: 'Oculus', deviceModel: 'Quest 3', osName: 'Android', osVersion: '12L', androidSdkVersion: 32 }
+    ),
+    fetchInnerTubeMp4(
+      videoId,
+      'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+      '2.0',
+      'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 TV Safari/537.36',
+      visitorData,
+      {},
+      { thirdParty: { embedUrl: 'https://www.youtube.com/' } },
+      sts
+    ),
+  ]);
 }
 
 async function getSoundCloudClientId(): Promise<string> {
@@ -335,11 +491,14 @@ function isFullTranscoding(t: any): boolean {
   return true;
 }
 
-async function fetchFromSoundCloudQuery(rawQuery: string): Promise<AudioSource> {
+async function fetchVerifiedSoundCloudTrack(
+  rawQuery: string,
+  expectedDurationSec = 0
+): Promise<AudioSource> {
   const clientId = await getSoundCloudClientId();
   const cleanQuery = cleanTrackQuery(rawQuery) || rawQuery;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5500);
+  const timer = setTimeout(() => controller.abort(), 5000);
 
   try {
     const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(cleanQuery)}&client_id=${clientId}&limit=15`;
@@ -355,221 +514,89 @@ async function fetchFromSoundCloudQuery(rawQuery: string): Promise<AudioSource> 
     const data = await res.json();
     const items: any[] = Array.isArray(data?.collection) ? data.collection : [];
 
-    const rankedTracks = items
-      .filter(
-        (item) =>
-          Array.isArray(item?.media?.transcodings) &&
-          (item.duration || 0) >= 45000 &&
-          item.policy !== 'BLOCK'
-      )
-      .map((item) => ({ item, score: scoreSoundCloudCandidate(item, cleanQuery) }))
-      .filter((entry) => entry.score > -50)
-      .sort((a, b) => b.score - a.score)
-      .map((entry) => entry.item);
+    const validOriginals = items
+      .filter((item) => {
+        if (!Array.isArray(item?.media?.transcodings)) return false;
+        if (item.policy === 'BLOCK' || item.policy === 'SNIP') return false;
 
-    for (const track of rankedTracks) {
+        const durSec = (item.duration || 0) / 1000;
+        if (durSec < 45 || durSec > 600) return false;
+
+        // Строгая проверка на ремиксы, лайвы и каверы во всех полях трека
+        const metaBlob = `${item.title || ''} ${item.tag_list || ''} ${item.genre || ''} ${item.user?.username || ''}`;
+        if (hasUnwantedVariant(metaBlob, cleanQuery)) return false;
+
+        // Проверяем доказательство оригинальности: официальный дистрибьютор (ISRC/publisher_metadata), галочка или точная длительность
+        const hasPublisherMeta = Boolean(item.publisher_metadata?.isrc || item.publisher_metadata?.release_title);
+        const isVerifiedUser = Boolean(item.user?.verified);
+        const durationMatches = expectedDurationSec > 0 && Math.abs(durSec - expectedDurationSec) <= 4;
+
+        if (!hasPublisherMeta && !isVerifiedUser && !durationMatches) {
+          return false;
+        }
+
+        if (expectedDurationSec > 0 && Math.abs(durSec - expectedDurationSec) > 6) {
+          return false;
+        }
+
+        return true;
+      })
+      .sort((a, b) => {
+        const aOfficial = (a.publisher_metadata?.isrc ? 2 : 0) + (a.user?.verified ? 1 : 0);
+        const bOfficial = (b.publisher_metadata?.isrc ? 2 : 0) + (b.user?.verified ? 1 : 0);
+        return bOfficial - aOfficial;
+      });
+
+    for (const track of validOriginals) {
       const progressive = track.media.transcodings.find(
         (t: any) => isFullTranscoding(t) && t?.format?.protocol === 'progressive'
       );
-      if (!progressive) continue;
-
-      const streamInfoRes = await fetch(`${progressive.url}?client_id=${clientId}`, {
-        signal: controller.signal,
-      });
-      if (!streamInfoRes.ok) continue;
-
-      const streamInfo = await streamInfoRes.json();
-      if (streamInfo?.url && !streamInfo.url.includes('/preview/')) {
-        return {
-          url: streamInfo.url,
-          mimeType: 'audio/mpeg',
-          isHls: false,
-        };
+      if (progressive) {
+        const infoRes = await fetch(`${progressive.url}?client_id=${clientId}`, { signal: controller.signal });
+        if (infoRes.ok) {
+          const info = await infoRes.json();
+          if (info?.url && !info.url.includes('/preview/')) {
+            return { url: info.url, mimeType: 'audio/mpeg', isHls: false };
+          }
+        }
       }
-    }
 
-    for (const track of rankedTracks) {
       const hls = track.media.transcodings.find(
         (t: any) => isFullTranscoding(t) && t?.format?.protocol === 'hls'
       );
-      if (!hls) continue;
-
-      const streamInfoRes = await fetch(`${hls.url}?client_id=${clientId}`, {
-        signal: controller.signal,
-      });
-      if (!streamInfoRes.ok) continue;
-
-      const streamInfo = await streamInfoRes.json();
-      if (streamInfo?.url && !streamInfo.url.includes('/preview/')) {
-        return {
-          url: streamInfo.url,
-          mimeType: 'application/vnd.apple.mpegurl',
-          isHls: true,
-        };
+      if (hls) {
+        const infoRes = await fetch(`${hls.url}?client_id=${clientId}`, { signal: controller.signal });
+        if (infoRes.ok) {
+          const info = await infoRes.json();
+          if (info?.url && !info.url.includes('/preview/')) {
+            return { url: info.url, mimeType: 'application/vnd.apple.mpegurl', isHls: true };
+          }
+        }
       }
     }
 
-    throw new Error('No original full-length stream on SoundCloud');
+    throw new Error('No verified original full track on SoundCloud');
   } finally {
     clearTimeout(timer);
   }
 }
 
 async function fetchYoutubeTitleOEmbed(videoId: string): Promise<string> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3500);
-  try {
-    const res = await fetch(
-      `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
-      { signal: controller.signal }
-    );
-    if (!res.ok) throw new Error('oEmbed failed');
-    const data = await res.json();
-    const title = cleanTrackQuery(String(data?.title || ''));
-    const author = String(data?.author_name || '').replace(/\s*-\s*Topic$/i, '').trim();
-    if (!title) throw new Error('Empty title');
-    return author && !title.toLowerCase().includes(author.toLowerCase())
-      ? `${author} - ${title}`
-      : title;
-  } finally {
-    clearTimeout(timer);
-  }
+  const res = await fetch(
+    `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
+    { signal: AbortSignal.timeout(3500) }
+  );
+  if (!res.ok) throw new Error('oEmbed failed');
+  const data = await res.json();
+  const title = cleanTrackQuery(String(data?.title || ''));
+  const author = String(data?.author_name || '').replace(/\s*-\s*Topic$/i, '').trim();
+  if (!title) throw new Error('Empty title');
+  return author && !title.toLowerCase().includes(author.toLowerCase()) ? `${author} - ${title}` : title;
 }
 
-async function fetchInnerTubeMp4(
-  videoId: string,
-  clientName: string,
-  clientVersion: string,
-  ua: string,
-  extraClient: Record<string, any> = {},
-  extraContext: Record<string, any> = {}
-): Promise<AudioSource> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 4500);
-  try {
-    const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
-      method: 'POST',
-      signal: controller.signal,
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': ua,
-      },
-      body: JSON.stringify({
-        videoId,
-        context: {
-          client: {
-            clientName,
-            clientVersion,
-            hl: 'en',
-            gl: 'US',
-            ...extraClient,
-          },
-          ...extraContext,
-        },
-        contentCheckOk: true,
-        racyCheckOk: true,
-      }),
-    });
-    if (!res.ok) throw new Error('InnerTube HTTP ' + res.status);
-    const data = await res.json();
-    const formats = [
-      ...(data?.streamingData?.adaptiveFormats || []),
-      ...(data?.streamingData?.formats || []),
-    ];
-
-    const mp4Audio = formats
-      .filter(
-        (f: any) =>
-          f.url &&
-          typeof f.mimeType === 'string' &&
-          f.mimeType.toLowerCase().includes('audio/mp4')
-      )
-      .sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0));
-
-    if (!mp4Audio[0]?.url) throw new Error('No audio/mp4 format');
-    return {
-      url: mp4Audio[0].url,
-      mimeType: 'audio/mp4',
-      isHls: false,
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function fetchPipedExactMp4(base: string, videoId: string): Promise<AudioSource> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 4500);
-  try {
-    const res = await fetch(`${base}/streams/${videoId}`, { signal: controller.signal });
-    if (!res.ok) throw new Error('Piped HTTP ' + res.status);
-    const data = await res.json();
-    const streams = (data?.audioStreams || [])
-      .filter((s: any) => s?.url && (s.mimeType || '').includes('mp4'))
-      .sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0));
-    if (!streams[0]?.url) throw new Error('No Piped mp4 stream');
-    return {
-      url: streams[0].url,
-      mimeType: 'audio/mp4',
-      isHls: false,
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function fetchInvidiousExactMp4(base: string, videoId: string): Promise<AudioSource> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 4500);
-  try {
-    const res = await fetch(`${base}/api/v1/videos/${videoId}`, { signal: controller.signal });
-    if (!res.ok) throw new Error('Invidious HTTP ' + res.status);
-    const data = await res.json();
-    const formats = (data?.adaptiveFormats || [])
-      .filter((f: any) => f?.url && typeof f.type === 'string' && f.type.includes('audio/mp4'))
-      .sort((a: any, b: any) => Number(b.bitrate || 0) - Number(a.bitrate || 0));
-    if (!formats[0]?.url) throw new Error('No Invidious mp4 stream');
-    return {
-      url: formats[0].url,
-      mimeType: 'audio/mp4',
-      isHls: false,
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function fetchExactYoutubeStream(videoId: string): Promise<AudioSource> {
-  return Promise.any([
-    fetchInnerTubeMp4(
-      videoId,
-      'IOS',
-      '19.45.4',
-      'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
-      { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' }
-    ),
-    fetchInnerTubeMp4(
-      videoId,
-      'ANDROID_VR',
-      '1.60.19',
-      'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
-      { deviceMake: 'Oculus', deviceModel: 'Quest 3', osName: 'Android', osVersion: '12L', androidSdkVersion: 32 }
-    ),
-    fetchInnerTubeMp4(
-      videoId,
-      'WEB_EMBEDDED_PLAYER',
-      '1.20241126.01.00',
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      {},
-      { thirdParty: { embedUrl: 'https://www.youtube.com/' } }
-    ),
-    ...PIPED_INSTANCES.map((base) => fetchPipedExactMp4(base, videoId)),
-    ...INVIDIOUS_INSTANCES.map((base) => fetchInvidiousExactMp4(base, videoId)),
-  ]);
-}
-
-async function getAudioSource(rawId: string): Promise<AudioSource> {
-  const cached = streamUrlCache.get(rawId);
+async function getAudioSource(rawId: string, expectedDurationSec = 0): Promise<AudioSource> {
+  const cacheKey = `${rawId}:${expectedDurationSec}`;
+  const cached = streamUrlCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
     return { url: cached.url, mimeType: cached.mimeType, isHls: cached.isHls };
   }
@@ -580,23 +607,18 @@ async function getAudioSource(rawId: string): Promise<AudioSource> {
   if (rawId.startsWith('ytq:')) {
     fallbackQuery = safeDecode(rawId.split(':').slice(2).join(':')).trim();
     if (!fallbackQuery) throw new Error('Empty track query');
-    videoId = await resolveYtqToOfficialVideoId(fallbackQuery);
+    videoId = await resolveYtqToOfficialVideoId(fallbackQuery, expectedDurationSec);
   }
 
-  const ytPromise = fetchExactYoutubeStream(videoId);
-  const scPromise = (async () => {
+  let resolved: AudioSource;
+  try {
+    resolved = await fetchExactYoutubeStream(videoId);
+  } catch {
     const q = fallbackQuery || (await fetchYoutubeTitleOEmbed(videoId));
-    return fetchFromSoundCloudQuery(q);
-  })();
+    resolved = await fetchVerifiedSoundCloudTrack(q, expectedDurationSec);
+  }
 
-  const exactYoutubeResult = await Promise.race([
-    ytPromise.catch(() => null),
-    new Promise<null>((resolve) => setTimeout(() => resolve(null), 4500)),
-  ]);
-
-  const resolved = exactYoutubeResult || (await Promise.any([ytPromise, scPromise]));
-
-  streamUrlCache.set(rawId, {
+  streamUrlCache.set(cacheKey, {
     url: resolved.url,
     mimeType: resolved.mimeType,
     isHls: resolved.isHls,
@@ -689,7 +711,19 @@ async function handleStream(
       return NextResponse.json({ error: 'Missing track id' }, { status: 400 });
     }
 
-    const source = await getAudioSource(rawId);
+    const expectedDurationSec = Number(req.nextUrl.searchParams.get('d') || '0') || 0;
+
+    if (req.nextUrl.searchParams.get('resolve') === '1') {
+      const videoId = rawId.startsWith('ytq:')
+        ? await resolveYtqToOfficialVideoId(
+            safeDecode(rawId.split(':').slice(2).join(':')).trim(),
+            expectedDurationSec
+          )
+        : rawId;
+      return NextResponse.json({ videoId });
+    }
+
+    const source = await getAudioSource(rawId, expectedDurationSec);
 
     if (req.nextUrl.searchParams.get('prefetch') === '1') {
       return NextResponse.json({ ok: true });
@@ -714,8 +748,8 @@ async function handleStream(
     });
 
     if (upstream.status === 403 || upstream.status === 410) {
-      streamUrlCache.delete(rawId);
-      const fresh = await getAudioSource(rawId);
+      streamUrlCache.delete(`${rawId}:${expectedDurationSec}`);
+      const fresh = await getAudioSource(rawId, expectedDurationSec);
       if (fresh.isHls) {
         return handleHlsStream(req, fresh.url, isHead);
       }

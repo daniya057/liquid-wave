@@ -1,214 +1,197 @@
 // @ts-nocheck
 import { NextRequest, NextResponse } from 'next/server';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
-import path from 'path';
-import fs from 'fs';
 
-const execFileAsync = promisify(execFile);
+const metaStore: Map<string, { title: string; artist: string; duration: number }> =
+  (globalThis as any).__lwMetaStore || new Map();
+(globalThis as any).__lwMetaStore = metaStore;
 
-type ResolvedSource =
-  | { type: 'remote'; url: string; exp: number }
-  | { type: 'file'; filePath: string; exp: number };
+const streamCache = new Map<string, { url: string; mode: 'proxy' | 'redirect'; exp: number }>();
+const inFlight = new Map<string, Promise<{ url: string; mode: 'proxy' | 'redirect' }>>();
+let scClientId = { id: '', exp: 0 };
 
-const sourceCache = new Map<string, ResolvedSource>();
-const inFlight = new Map<string, Promise<ResolvedSource>>();
+const JUNK_WORDS = ['remix', 'slowed', 'reverb', 'cover', 'karaoke', 'nightcore', '8d', 'sped up', 'instrumental', 'mashup', 'ringtone'];
 
-function getYtDlpPath(): string {
-  const bin = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
-  const local = path.join(process.cwd(), 'node_modules', 'youtube-dl-exec', 'bin', bin);
-  return fs.existsSync(local) ? local : 'yt-dlp';
-}
-
-function nodeStreamToWeb(nodeStream: fs.ReadStream): ReadableStream<Uint8Array> {
-  return new ReadableStream({
-    start(controller) {
-      nodeStream.on('data', (chunk) => controller.enqueue(new Uint8Array(Buffer.from(chunk))));
-      nodeStream.on('end', () => controller.close());
-      nodeStream.on('error', (err) => controller.error(err));
-    },
-    cancel() {
-      nodeStream.destroy();
-    },
-  });
-}
-
-function cleanupTmpFiles() {
-  try {
-    const files = fs
-      .readdirSync('/tmp')
-      .filter((f) => f.startsWith('lw_'))
-      .map((f) => {
-        const full = path.join('/tmp', f);
-        return { full, time: fs.statSync(full).mtimeMs };
-      })
-      .sort((a, b) => b.time - a.time);
-
-    for (const old of files.slice(25)) {
-      fs.unlinkSync(old.full);
-    }
-  } catch {}
-}
-
-async function getTrackQuery(videoId: string): Promise<string> {
-  const res = await fetch(
-    `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&format=json`,
-    { signal: AbortSignal.timeout(4000) }
-  );
-  if (!res.ok) throw new Error('Не удалось получить название трека');
-  const data = await res.json();
-
-  const cleanTitle = String(data.title || '')
+function cleanTitle(str: string): string {
+  return str
     .replace(/\(official.*?\)|\[official.*?\]|\(lyrics.*?\)|\[lyrics.*?\]|\(audio.*?\)|\(video.*?\)|\(hd\)|\(4k\)|премьера трека|клип/gi, '')
     .trim();
-  const cleanAuthor = String(data.author_name || '')
-    .replace(/\s*-\s*Topic$/i, '')
-    .replace(/VEVO$/i, '')
-    .trim();
-
-  if (!cleanTitle) return cleanAuthor;
-  if (cleanAuthor && !cleanTitle.toLowerCase().includes(cleanAuthor.toLowerCase())) {
-    return `${cleanAuthor} - ${cleanTitle}`;
-  }
-  return cleanTitle;
 }
 
-async function tryFastCdn(query: string): Promise<string | null> {
-  const endpoints = [
-    `https://saavn.dev/api/search/songs?query=${encodeURIComponent(query)}&limit=3`,
-    `https://jiosaavn-api-privatecvc2.vercel.app/search/songs?query=${encodeURIComponent(query)}`,
+function tokens(str: string): string[] {
+  return str.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter((w) => w.length > 1);
+}
+
+function isStrictMatch(candTitle: string, candArtist: string, candDurSec: number, orig: { title: string; artist: string; duration: number }): boolean {
+  if (candDurSec > 0 && candDurSec < 45) return false;
+  if (orig.duration > 0 && candDurSec > 0 && Math.abs(candDurSec - orig.duration) > 16) return false;
+
+  const origLow = `${orig.artist} ${orig.title}`.toLowerCase();
+  const candLow = `${candArtist} ${candTitle}`.toLowerCase();
+  for (const bad of JUNK_WORDS) {
+    if (candLow.includes(bad) && !origLow.includes(bad)) return false;
+  }
+
+  const titleWords = tokens(cleanTitle(orig.title));
+  if (titleWords.length === 0) return false;
+  const candSet = new Set(tokens(`${candArtist} ${candTitle}`));
+  const matched = titleWords.filter((w) => candSet.has(w)).length;
+  return matched / titleWords.length >= 0.6;
+}
+
+async function fetchYoutubePlayer(videoId: string, client: any) {
+  const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': client.ua },
+    body: JSON.stringify({ context: { client: client.ctx }, videoId }),
+    signal: AbortSignal.timeout(4000),
+  });
+  if (!res.ok) return null;
+  return res.json();
+}
+
+async function getTrackMeta(videoId: string) {
+  if (metaStore.has(videoId)) return metaStore.get(videoId)!;
+  const data = await fetchYoutubePlayer(videoId, {
+    ua: 'Mozilla/5.0',
+    ctx: { clientName: 'WEB', clientVersion: '2.20241126.01.00' },
+  });
+  const details = data?.videoDetails;
+  if (details?.title) {
+    const meta = {
+      title: String(details.title),
+      artist: String(details.author || '').replace(/\s*-\s*Topic$/i, '').trim(),
+      duration: Number(details.lengthSeconds) || 0,
+    };
+    metaStore.set(videoId, meta);
+    return meta;
+  }
+  const oembed = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
+  const o = await oembed.json();
+  const meta = { title: o.title || '', artist: (o.author_name || '').replace(/\s*-\s*Topic$/i, ''), duration: 0 };
+  metaStore.set(videoId, meta);
+  return meta;
+}
+
+async function tryYoutubeDirect(videoId: string): Promise<string | null> {
+  const clients = [
+    {
+      ua: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1 like Mac OS X)',
+      ctx: { clientName: 'IOS', clientVersion: '19.45.4', deviceModel: 'iPhone16,2', osName: 'iOS', osVersion: '18.1' },
+    },
+    {
+      ua: 'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; Quest 3 Build/SQ3A.220605.009.A1)',
+      ctx: { clientName: 'ANDROID_VR', clientVersion: '1.60.19', deviceMake: 'Oculus', deviceModel: 'Quest 3', osName: 'Android', osVersion: '12L' },
+    },
   ];
 
-  for (const endpoint of endpoints) {
+  for (const c of clients) {
     try {
-      const res = await fetch(endpoint, { signal: AbortSignal.timeout(4000) });
-      if (!res.ok) continue;
-      const json = await res.json();
-      const results = json?.data?.results || json?.results || [];
+      const data = await fetchYoutubePlayer(videoId, c);
+      const formats = data?.streamingData?.adaptiveFormats || [];
+      const audio = formats
+        .filter((f: any) => f.mimeType?.startsWith('audio/') && f.url)
+        .sort((a: any, b: any) => (a.mimeType.includes('audio/mp4') ? -1 : 1) || (b.bitrate || 0) - (a.bitrate || 0))[0];
 
-      for (const item of results) {
-        const downloads = item?.downloadUrl || [];
-        if (Array.isArray(downloads) && downloads.length > 0) {
-          const best =
-            downloads.find((d: any) => d.quality === '320kbps') ||
-            downloads.find((d: any) => d.quality === '160kbps') ||
-            downloads[downloads.length - 1];
-          const url = best?.url || best?.link;
-          if (url && url.startsWith('http')) {
-            return url;
-          }
-        }
+      if (audio?.url) {
+        const probe = await fetch(audio.url, { headers: { Range: 'bytes=0-511' }, signal: AbortSignal.timeout(2500) });
+        if (probe.ok || probe.status === 206) return audio.url;
       }
     } catch {}
   }
   return null;
 }
 
-async function trySoundCloudDownload(videoId: string, query: string): Promise<string> {
-  const existing = fs.readdirSync('/tmp').find((f) => f.startsWith(`lw_${videoId}.`) && !f.endsWith('.part'));
-  if (existing) {
-    const full = path.join('/tmp', existing);
-    if (fs.statSync(full).size > 10000) return full;
-  }
-
-  cleanupTmpFiles();
-  const outTemplate = path.join('/tmp', `lw_${videoId}.%(ext)s`);
-  const args = [
-    '-f', 'bestaudio',
-    '--fixup', 'never',
-    '--match-filter', 'duration > 60',
-    '--max-downloads', '1',
-    '--no-warnings',
-    '--no-cache-dir',
-    '-o', outTemplate,
-    `scsearch2:${query}`,
-  ];
-
+async function tryVerifiedCdn(meta: { title: string; artist: string; duration: number }): Promise<string | null> {
+  const q = `${meta.artist} ${cleanTitle(meta.title)}`.trim();
   try {
-    await execFileAsync(getYtDlpPath(), args, { timeout: 25000 });
-  } catch {
-    // yt-dlp при --max-downloads 1 завершается с кодом 101 после успешного скачивания файла
-  }
-
-  const downloaded = fs
-    .readdirSync('/tmp')
-    .find((f) => f.startsWith(`lw_${videoId}.`) && !f.endsWith('.part') && !f.endsWith('.ytdl'));
-
-  if (!downloaded) {
-    throw new Error(`Не удалось загрузить аудио для "${query}"`);
-  }
-
-  const fullPath = path.join('/tmp', downloaded);
-  if (fs.statSync(fullPath).size < 10000) {
-    throw new Error('Скачался пустой файл');
-  }
-
-  return fullPath;
+    const res = await fetch(`https://saavn.dev/api/search/songs?query=${encodeURIComponent(q)}&limit=5`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    for (const item of json?.data?.results || []) {
+      const candArtist = item?.artists?.primary?.map((a: any) => a.name).join(' ') || '';
+      if (!isStrictMatch(item.name || '', candArtist, Number(item.duration) || 0, meta)) continue;
+      const dl = item.downloadUrl || [];
+      const best = dl.find((d: any) => d.quality === '320kbps') || dl[dl.length - 1];
+      if (best?.url) return best.url;
+    }
+  } catch {}
+  return null;
 }
 
-async function resolveAudioSource(videoId: string): Promise<ResolvedSource> {
-  const cached = sourceCache.get(videoId);
-  if (cached && cached.exp > Date.now()) {
-    if (cached.type === 'remote' || fs.existsSync(cached.filePath)) {
-      return cached;
+async function getScClientId(): Promise<string> {
+  if (scClientId.id && scClientId.exp > Date.now()) return scClientId.id;
+  const html = await (await fetch('https://soundcloud.com', { signal: AbortSignal.timeout(4000) })).text();
+  const scripts = [...html.matchAll(/https:\/\/a-v2\.sndcdn\.com\/assets\/[^"']+\.js/g)].map((m) => m[0]).slice(-3);
+  for (const sUrl of scripts.reverse()) {
+    const js = await (await fetch(sUrl, { signal: AbortSignal.timeout(4000) })).text();
+    const m = js.match(/client_id\s*:\s*"([a-zA-Z0-9]{32})"/);
+    if (m?.[1]) {
+      scClientId = { id: m[1], exp: Date.now() + 12 * 3600 * 1000 };
+      return m[1];
     }
   }
+  throw new Error('SC client_id не найден');
+}
 
+async function tryVerifiedSoundCloud(meta: { title: string; artist: string; duration: number }): Promise<string | null> {
+  try {
+    const cid = await getScClientId();
+    const q = `${meta.artist} - ${cleanTitle(meta.title)}`.trim();
+    const res = await fetch(
+      `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(q)}&client_id=${cid}&limit=10`,
+      { signal: AbortSignal.timeout(4000) }
+    );
+    const json = await res.json();
+    for (const item of json?.collection || []) {
+      if (item.policy === 'SNIP') continue;
+      if (!isStrictMatch(item.title || '', item.user?.username || '', Math.round((item.duration || 0) / 1000), meta)) continue;
+      const prog = (item.media?.transcodings || []).find((t: any) => t.format?.protocol === 'progressive');
+      if (!prog?.url) continue;
+      const streamRes = await fetch(`${prog.url}?client_id=${cid}`, { signal: AbortSignal.timeout(3000) });
+      const streamJson = await streamRes.json();
+      if (streamJson?.url) return streamJson.url;
+    }
+  } catch {}
+  return null;
+}
+
+async function resolveStream(videoId: string) {
+  const cached = streamCache.get(videoId);
+  if (cached && cached.exp > Date.now()) return cached;
   if (inFlight.has(videoId)) return inFlight.get(videoId)!;
 
-  const task = (async (): Promise<ResolvedSource> => {
-    const query = await getTrackQuery(videoId);
-    console.log(`[STREAM] Поиск потока для "${query}"...`);
-
-    const cdnUrl = await tryFastCdn(query);
-    if (cdnUrl) {
-      console.log(`[STREAM] Найден студийный поток для "${query}"`);
-      const src: ResolvedSource = { type: 'remote', url: cdnUrl, exp: Date.now() + 3 * 3600 * 1000 };
-      sourceCache.set(videoId, src);
-      return src;
+  const task = (async () => {
+    const t0 = Date.now();
+    const ytUrl = await tryYoutubeDirect(videoId);
+    if (ytUrl) {
+      console.log(`[STREAM] YouTube оригинал ${videoId} за ${Date.now() - t0}ms`);
+      const res = { url: ytUrl, mode: 'proxy' as const, exp: Date.now() + 3 * 3600 * 1000 };
+      streamCache.set(videoId, res);
+      return res;
     }
 
-    const filePath = await trySoundCloudDownload(videoId, query);
-    console.log(`[STREAM] Загружен файл SoundCloud для "${query}"`);
-    const src: ResolvedSource = { type: 'file', filePath, exp: Date.now() + 2 * 3600 * 1000 };
-    sourceCache.set(videoId, src);
-    return src;
+    const meta = await getTrackMeta(videoId);
+    const [cdnUrl, scUrl] = await Promise.all([tryVerifiedCdn(meta), tryVerifiedSoundCloud(meta)]);
+
+    if (cdnUrl) {
+      console.log(`[STREAM] CDN оригинал "${meta.title}" за ${Date.now() - t0}ms`);
+      const res = { url: cdnUrl, mode: 'redirect' as const, exp: Date.now() + 3 * 3600 * 1000 };
+      streamCache.set(videoId, res);
+      return res;
+    }
+    if (scUrl) {
+      console.log(`[STREAM] SoundCloud оригинал "${meta.title}" за ${Date.now() - t0}ms`);
+      const res = { url: scUrl, mode: 'proxy' as const, exp: Date.now() + 3600 * 1000 };
+      streamCache.set(videoId, res);
+      return res;
+    }
+    throw new Error(`Оригинал "${meta.title}" не найден`);
   })().finally(() => inFlight.delete(videoId));
 
   inFlight.set(videoId, task);
   return task;
-}
-
-function serveLocalFile(req: NextRequest, filePath: string) {
-  const stat = fs.statSync(filePath);
-  const total = stat.size;
-  const ext = path.extname(filePath).toLowerCase();
-  const contentType =
-    ext === '.m4a' || ext === '.mp4' ? 'audio/mp4' : ext === '.ogg' || ext === '.opus' ? 'audio/ogg' : 'audio/mpeg';
-
-  const range = req.headers.get('range');
-  const headers = new Headers();
-  headers.set('Content-Type', contentType);
-  headers.set('Access-Control-Allow-Origin', '*');
-  headers.set('Accept-Ranges', 'bytes');
-  headers.set('Cache-Control', 'public, max-age=3600');
-
-  if (range) {
-    const parts = range.replace(/bytes=/, '').split('-');
-    const start = parseInt(parts[0], 10) || 0;
-    const end = parts[1] ? Math.min(parseInt(parts[1], 10), total - 1) : total - 1;
-    const chunkSize = end - start + 1;
-
-    headers.set('Content-Range', `bytes ${start}-${end}/${total}`);
-    headers.set('Content-Length', String(chunkSize));
-
-    const stream = fs.createReadStream(filePath, { start, end });
-    return new NextResponse(nodeStreamToWeb(stream), { status: 206, headers });
-  }
-
-  headers.set('Content-Length', String(total));
-  const stream = fs.createReadStream(filePath);
-  return new NextResponse(nodeStreamToWeb(stream), { status: 200, headers });
 }
 
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
@@ -220,7 +203,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
 
   if (req.nextUrl.searchParams.get('prefetch') === '1') {
     try {
-      await resolveAudioSource(id);
+      await resolveStream(id);
       return NextResponse.json({ ok: true });
     } catch {
       return NextResponse.json({ ok: false }, { status: 502 });
@@ -228,27 +211,25 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
   }
 
   try {
-    const source = await resolveAudioSource(id);
-
-    if (source.type === 'file') {
-      return serveLocalFile(req, source.filePath);
-    }
+    const target = await resolveStream(id);
+    if (target.mode === 'redirect') return NextResponse.redirect(target.url, 302);
 
     const range = req.headers.get('range');
-    const fetchHeaders: HeadersInit = { 'User-Agent': 'Mozilla/5.0' };
-    if (range) fetchHeaders['Range'] = range;
+    const headersIn: HeadersInit = { 'User-Agent': 'Mozilla/5.0' };
+    if (range) headersIn['Range'] = range;
 
-    const audioRes = await fetch(source.url, { headers: fetchHeaders });
+    const audioRes = await fetch(target.url, { headers: headersIn });
     if (!audioRes.ok && audioRes.status !== 206) {
-      sourceCache.delete(id);
+      streamCache.delete(id);
       return NextResponse.json({ error: 'Stream unavailable' }, { status: 502 });
     }
 
-    const headers = new Headers();
-    headers.set('Content-Type', audioRes.headers.get('content-type') || 'audio/mp4');
-    headers.set('Access-Control-Allow-Origin', '*');
-    headers.set('Accept-Ranges', 'bytes');
-    headers.set('Cache-Control', 'public, max-age=3600');
+    const headers = new Headers({
+      'Content-Type': audioRes.headers.get('content-type') || 'audio/mp4',
+      'Access-Control-Allow-Origin': '*',
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'public, max-age=3600',
+    });
     const len = audioRes.headers.get('content-length');
     const rng = audioRes.headers.get('content-range');
     if (len) headers.set('Content-Length', len);
@@ -257,7 +238,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     return new NextResponse(audioRes.body, { status: audioRes.status, headers });
   } catch (err: any) {
     console.error(`[STREAM] Сбой ${id}:`, err.message);
-    sourceCache.delete(id);
+    streamCache.delete(id);
     return NextResponse.json({ error: 'Audio stream error' }, { status: 502 });
   }
 }

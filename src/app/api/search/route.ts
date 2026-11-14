@@ -4,20 +4,18 @@ import yts from 'yt-search';
 import { WAVE_SEEDS } from '@/lib/instances';
 
 const cache = new Map<string, { data: any; exp: number }>();
-const metaCache: Map<string, string> = (globalThis as any).__lwMeta || new Map();
-(globalThis as any).__lwMeta = metaCache;
+const metaStore: Map<string, { title: string; artist: string; duration: number }> =
+  (globalThis as any).__lwMetaStore || new Map();
+(globalThis as any).__lwMetaStore = metaStore;
 
-function saveTrackMeta(tracks: any[]) {
+function saveMeta(tracks: any[]) {
   for (const t of tracks) {
     if (!t?.id || !t?.title) continue;
-    const cleanAuthor = String(t.artist || '').replace(/\s*-\s*Topic$/i, '').replace(/VEVO$/i, '').trim();
-    const cleanTitle = String(t.title)
-      .replace(/\(official.*?\)|\[official.*?\]|\(lyrics.*?\)|\[lyrics.*?\]|\(audio.*?\)|\(video.*?\)|\(hd\)|\(4k\)|премьера трека|клип/gi, '')
-      .trim();
-    const q = cleanAuthor && !cleanTitle.toLowerCase().includes(cleanAuthor.toLowerCase())
-      ? `${cleanAuthor} - ${cleanTitle}`
-      : cleanTitle;
-    metaCache.set(t.id, q);
+    metaStore.set(t.id, {
+      title: String(t.title),
+      artist: String(t.artist || '').replace(/\s*-\s*Topic$/i, '').replace(/VEVO$/i, '').trim(),
+      duration: Number(t.duration) || 0,
+    });
   }
 }
 
@@ -71,7 +69,7 @@ async function ytSearch(query: string) {
       }
     }
   }
-  saveTrackMeta(tracks);
+  saveMeta(tracks);
   return { tracks, albums };
 }
 
@@ -92,7 +90,7 @@ export async function GET(req: NextRequest) {
         thumbnail: v.thumbnail || `https://i.ytimg.com/vi/${v.videoId}/mqdefault.jpg`,
         duration: v.seconds || 0,
       }));
-      saveTrackMeta(tracks);
+      saveMeta(tracks);
       return NextResponse.json({ title: pl.title || 'Альбом', tracks });
     }
 

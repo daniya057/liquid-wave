@@ -1,120 +1,242 @@
-// @ts-nocheck
 import { NextRequest, NextResponse } from 'next/server';
-import yts from 'yt-search';
 
-const cache = new Map<string, { data: any; exp: number }>();
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
-const WAVE_SEEDS = [
-  'top hits audio',
-  'инди рок хиты audio',
-  'synthwave chill audio',
-  'альтернативный рок хиты audio',
-  'lo-fi beats audio',
-  'поп хиты 2025 audio',
-  'electronic dance hits audio',
+const streamUrlCache = new Map<string, { url: string; mimeType: string; expiresAt: number }>();
+
+const PIPED_INSTANCES = [
+  'https://pipedapi.kavin.rocks',
+  'https://pipedapi.adminforge.de',
+  'https://api.piped.private.coffee',
+  'https://pipedapi.drgns.space',
 ];
 
-function parseSec(text?: string): number {
-  if (!text) return 0;
-  const p = text.split(':').map(Number);
-  if (p.some(isNaN)) return 0;
-  return p.length === 3 ? p[0] * 3600 + p[1] * 60 + p[2] : p.length === 2 ? p[0] * 60 + p[1] : p[0] || 0;
+async function resolveYtqId(rawId: string): Promise<string> {
+  if (!rawId.startsWith('ytq:')) return rawId;
+  const query = decodeURIComponent(rawId.split(':').slice(2).join(':'));
+  const res = await fetch(
+    `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`,
+    {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      },
+    }
+  );
+  const html = await res.text();
+  const match = html.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
+  if (!match?.[1]) throw new Error('Track not found');
+  return match[1];
 }
 
-async function ytSearch(query: string) {
-  const res = await fetch('https://www.youtube.com/youtubei/v1/search?prettyPrint=false', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
-    body: JSON.stringify({
-      context: { client: { clientName: 'WEB', clientVersion: '2.20241126.01.00', hl: 'ru', gl: 'RU' } },
-      query,
-    }),
-    signal: AbortSignal.timeout(5000),
-  });
-  const json = await res.json();
-  const sections =
-    json?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents || [];
-  const tracks = [];
-  const albums = [];
-  const seen = new Set<string>();
+async function fetchFromInnerTube(videoId: string): Promise<{ url: string; mimeType: string } | null> {
+  const clients = [
+    {
+      name: 'ANDROID_VR',
+      context: {
+        client: {
+          clientName: 'ANDROID_VR',
+          clientVersion: '1.60.19',
+          deviceMake: 'Oculus',
+          deviceModel: 'Quest 3',
+          osName: 'Android',
+          osVersion: '12L',
+          androidSdkVersion: 32,
+          hl: 'en',
+          gl: 'US',
+        },
+      },
+      ua: 'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+    },
+    {
+      name: 'IOS',
+      context: {
+        client: {
+          clientName: 'IOS',
+          clientVersion: '19.45.4',
+          deviceMake: 'Apple',
+          deviceModel: 'iPhone16,2',
+          osName: 'iPhone',
+          osVersion: '18.1.0.22B83',
+          hl: 'en',
+          gl: 'US',
+        },
+      },
+      ua: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
+    },
+    {
+      name: 'ANDROID',
+      context: {
+        client: {
+          clientName: 'ANDROID',
+          clientVersion: '19.44.38',
+          androidSdkVersion: 34,
+          hl: 'en',
+          gl: 'US',
+        },
+      },
+      ua: 'com.google.android.youtube/19.44.38 (Linux; U; Android 14; en_US) gzip',
+    },
+  ];
 
-  for (const sec of sections) {
-    for (const item of sec?.itemSectionRenderer?.contents || []) {
-      if (item.videoRenderer) {
-        const v = item.videoRenderer;
-        const duration = parseSec(v.lengthText?.simpleText);
-        if (!v.videoId || seen.has(v.videoId) || (duration > 0 && (duration < 40 || duration > 900))) continue;
-        seen.add(v.videoId);
-        tracks.push({
-          id: v.videoId,
-          title: v.title?.runs?.[0]?.text || 'Без названия',
-          artist: (v.ownerText?.runs?.[0]?.text || 'Исполнитель').replace(/\s*-\s*Topic$/i, '').trim(),
-          thumbnail: `https://i.ytimg.com/vi/${v.videoId}/mqdefault.jpg`,
-          duration,
+  for (const client of clients) {
+    try {
+      const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': client.ua,
+        },
+        body: JSON.stringify({
+          videoId,
+          context: client.context,
+          contentCheckOk: true,
+          racyCheckOk: true,
+        }),
+      });
+
+      if (!res.ok) continue;
+      const data = await res.json();
+      const formats = [
+        ...(data?.streamingData?.adaptiveFormats || []),
+        ...(data?.streamingData?.formats || []),
+      ];
+
+      const audioFormats = formats
+        .filter((f: any) => f.url && typeof f.mimeType === 'string' && f.mimeType.startsWith('audio/'))
+        .sort((a: any, b: any) => {
+          // Предпочитаем m4a (audio/mp4) для идеальной совместимости с iPhone Safari
+          const aMp4 = a.mimeType.includes('mp4') ? 1 : 0;
+          const bMp4 = b.mimeType.includes('mp4') ? 1 : 0;
+          if (aMp4 !== bMp4) return bMp4 - aMp4;
+          return (b.bitrate || 0) - (a.bitrate || 0);
         });
-      } else if (item.playlistRenderer?.playlistId && !seen.has(item.playlistRenderer.playlistId)) {
-        const p = item.playlistRenderer;
-        seen.add(p.playlistId);
-        albums.push({
-          id: p.playlistId,
-          title: p.title?.simpleText || 'Альбом',
-          artist: p.shortBylineText?.runs?.[0]?.text || 'Исполнитель',
-          thumbnail: p.thumbnails?.[0]?.thumbnails?.[0]?.url || '',
-          trackCount: Number(p.videoCount) || undefined,
-        });
+
+      if (audioFormats[0]?.url) {
+        return {
+          url: audioFormats[0].url,
+          mimeType: audioFormats[0].mimeType.split(';')[0] || 'audio/mp4',
+        };
       }
+    } catch {
+      // пробуем следующий клиент
     }
   }
-  return { tracks, albums };
+
+  return null;
 }
 
-export async function GET(req: NextRequest) {
-  const { searchParams } = new URL(req.url);
-  const q = searchParams.get('q')?.trim() || '';
-  const mode = searchParams.get('mode');
-  const listId = searchParams.get('listId')?.trim();
-  const artist = searchParams.get('artist')?.trim();
+async function fetchFromPiped(videoId: string): Promise<{ url: string; mimeType: string } | null> {
+  for (const base of PIPED_INSTANCES) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 4500);
+      const res = await fetch(`${base}/streams/${videoId}`, { signal: controller.signal });
+      clearTimeout(timeout);
+      if (!res.ok) continue;
 
-  try {
-    if (listId) {
-      const pl = await yts({ listId });
-      const tracks = (pl.videos || []).map((v: any) => ({
-        id: v.videoId,
-        title: v.title,
-        artist: (v.author?.name || 'Исполнитель').replace(/\s*-\s*Topic$/i, '').trim(),
-        thumbnail: v.thumbnail || `https://i.ytimg.com/vi/${v.videoId}/mqdefault.jpg`,
-        duration: v.seconds || 0,
-      }));
-      return NextResponse.json({ title: pl.title || 'Альбом', tracks });
-    }
+      const data = await res.json();
+      const streams = (data?.audioStreams || []).sort((a: any, b: any) => {
+        const aM4a = (a.mimeType || '').includes('mp4') ? 1 : 0;
+        const bM4a = (b.mimeType || '').includes('mp4') ? 1 : 0;
+        if (aM4a !== bM4a) return bM4a - aM4a;
+        return (b.bitrate || 0) - (a.bitrate || 0);
+      });
 
-    if (artist) {
-      const data = await ytSearch(`${artist} topic`);
-      return NextResponse.json({ tracks: data.tracks.slice(0, 20), albums: data.albums.slice(0, 12) });
-    }
-
-    const isWave = mode === 'wave' || !q;
-    const query = isWave ? WAVE_SEEDS[Math.floor(Math.random() * WAVE_SEEDS.length)] : `${q} audio`;
-    const key = `q:${query.toLowerCase()}`;
-    if (!isWave && cache.get(key)?.exp > Date.now()) return NextResponse.json(cache.get(key)!.data);
-
-    const { tracks, albums } = await ytSearch(query);
-    const artistMap = new Map();
-    for (const t of tracks) {
-      const name = t.artist;
-      if (name && !artistMap.has(name.toLowerCase()) && artistMap.size < 12) {
-        artistMap.set(name.toLowerCase(), { id: name, name, thumbnail: t.thumbnail });
+      if (streams[0]?.url) {
+        return {
+          url: streams[0].url,
+          mimeType: streams[0].mimeType?.split(';')[0] || 'audio/mp4',
+        };
       }
+    } catch {
+      // пробуем следующий сервер
+    }
+  }
+  return null;
+}
+
+async function getAudioSource(videoId: string): Promise<{ url: string; mimeType: string }> {
+  const cached = streamUrlCache.get(videoId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { url: cached.url, mimeType: cached.mimeType };
+  }
+
+  const resolved = (await fetchFromInnerTube(videoId)) || (await fetchFromPiped(videoId));
+  if (!resolved) {
+    throw new Error('No audio stream available');
+  }
+
+  streamUrlCache.set(videoId, {
+    url: resolved.url,
+    mimeType: resolved.mimeType,
+    expiresAt: Date.now() + 1000 * 60 * 90, // 1.5 часа
+  });
+
+  return resolved;
+}
+
+export async function GET(
+  req: NextRequest,
+  context: { params: Promise<{ id: string }> | { id: string } }
+) {
+  try {
+    const resolvedParams = await Promise.resolve(context.params);
+    const rawId = decodeURIComponent(resolvedParams.id || '');
+    if (!rawId) {
+      return NextResponse.json({ error: 'Missing track id' }, { status: 400 });
     }
 
-    const result = {
-      tracks: tracks.slice(0, 25),
-      albums: albums.slice(0, 16),
-      artists: Array.from(artistMap.values()),
+    const videoId = await resolveYtqId(rawId);
+    const source = await getAudioSource(videoId);
+
+    // Если это просто предзагрузка (prefetch=1), прогрели кэш и выходим
+    if (req.nextUrl.searchParams.get('prefetch') === '1') {
+      return NextResponse.json({ ok: true, id: videoId });
+    }
+
+    const rangeHeader = req.headers.get('range');
+    const upstreamHeaders: Record<string, string> = {
+      'User-Agent':
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1',
     };
-    if (!isWave && tracks.length) cache.set(key, { data: result, exp: Date.now() + 1800000 });
-    return NextResponse.json(result);
-  } catch {
-    return NextResponse.json({ tracks: [], albums: [], artists: [] }, { status: 500 });
+    if (rangeHeader) {
+      upstreamHeaders['Range'] = rangeHeader;
+    }
+
+    let upstream = await fetch(source.url, { headers: upstreamHeaders });
+
+    // Если кэшированная ссылка протухла, обновляем один раз
+    if (upstream.status === 403 || upstream.status === 410) {
+      streamUrlCache.delete(videoId);
+      const fresh = await getAudioSource(videoId);
+      upstream = await fetch(fresh.url, { headers: upstreamHeaders });
+    }
+
+    if (!upstream.ok && upstream.status !== 206) {
+      return NextResponse.json({ error: 'Upstream stream failed' }, { status: 502 });
+    }
+
+    const responseHeaders = new Headers();
+    responseHeaders.set('Content-Type', upstream.headers.get('content-type') || source.mimeType);
+    responseHeaders.set('Accept-Ranges', 'bytes');
+    responseHeaders.set('Cache-Control', 'no-store');
+
+    const contentLength = upstream.headers.get('content-length');
+    if (contentLength) responseHeaders.set('Content-Length', contentLength);
+
+    const contentRange = upstream.headers.get('content-range');
+    if (contentRange) responseHeaders.set('Content-Range', contentRange);
+
+    return new NextResponse(upstream.body, {
+      status: upstream.status,
+      headers: responseHeaders,
+    });
+  } catch (err: any) {
+    return NextResponse.json(
+      { error: err?.message || 'Failed to stream audio' },
+      { status: 500 }
+    );
   }
 }

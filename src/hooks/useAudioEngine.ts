@@ -29,43 +29,17 @@ declare global {
   }
 }
 
-const resolvedIdsCache = new Map<string, { id: string; thumbnail: string; duration: number }>();
-
-// Генерируем тихий WAV-файл в памяти, чтобы iOS/Android не усыпляли аудиосессию при блокировке экрана
-function createSilentAudioUrl(): string {
-  if (typeof window === 'undefined') return '';
-  const sampleRate = 8000;
-  const numSamples = sampleRate * 2;
-  const buffer = new ArrayBuffer(44 + numSamples);
-  const view = new DataView(buffer);
-  const writeStr = (offset: number, str: string) => {
-    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
-  };
-  writeStr(0, 'RIFF');
-  view.setUint32(4, 36 + numSamples, true);
-  writeStr(8, 'WAVE');
-  writeStr(12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate, true);
-  view.setUint16(32, 1, true);
-  view.setUint16(34, 8, true);
-  writeStr(36, 'data');
-  view.setUint32(40, numSamples, true);
-  for (let i = 44; i < 44 + numSamples; i++) view.setUint8(i, 128);
-  return URL.createObjectURL(new Blob([buffer], { type: 'audio/wav' }));
-}
-
 export function useAudioEngine(onEndedOrOptions?: any) {
-  const audioRef = useRef<any>(null);
-  const playerRef = useRef<any>(null);
-  const readyRef = useRef(false);
-  const pendingRef = useRef<string | null>(null);
-  const errStreakRef = useRef(0);
-  const shouldBePlayingRef = useRef(false);
-  const silentUrlRef = useRef<string>('');
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const ytPlayerRef = useRef<any>(null);
+  const ytReadyRef = useRef(false);
+  const pendingYtIdRef = useRef<string | null>(null);
+  const modeRef = useRef<'native' | 'youtube'>('native');
+
+  // Web Audio API для эквалайзера (подключается только при изменении полос EQ, чтобы не мешать фону iOS)
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const filtersRef = useRef<BiquadFilterNode[]>([]);
+  const eqConnectedRef = useRef(false);
 
   const onEndedRef = useRef<any>(null);
   onEndedRef.current =
@@ -91,77 +65,97 @@ export function useAudioEngine(onEndedOrOptions?: any) {
   const stateRef = useRef({ queue, currentIndex });
   stateRef.current = { queue, currentIndex };
 
-  const syncBackgroundAudio = useCallback((play: boolean) => {
-    shouldBePlayingRef.current = play;
+  const ensureEqGraph = useCallback(() => {
     const el = audioRef.current;
-    if (!el) return;
-    if (play) {
-      if (!silentUrlRef.current) silentUrlRef.current = createSilentAudioUrl();
-      if (el.src !== silentUrlRef.current) {
-        el.src = silentUrlRef.current;
-        el.loop = true;
+    if (!el || eqConnectedRef.current || typeof window === 'undefined') return;
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const source = ctx.createMediaElementSource(el);
+      const filters = EQ_FREQUENCIES.map((freq, i) => {
+        const filter = ctx.createBiquadFilter();
+        filter.type = i === 0 ? 'lowshelf' : i === EQ_FREQUENCIES.length - 1 ? 'highshelf' : 'peaking';
+        filter.frequency.value = freq;
+        filter.Q.value = 1.4;
+        filter.gain.value = 0;
+        return filter;
+      });
+
+      source.connect(filters[0]);
+      for (let i = 0; i < filters.length - 1; i++) {
+        filters[i].connect(filters[i + 1]);
       }
-      el.play().catch(() => {});
-    } else {
-      el.pause();
+      filters[filters.length - 1].connect(ctx.destination);
+
+      audioCtxRef.current = ctx;
+      filtersRef.current = filters;
+      eqConnectedRef.current = true;
+    } catch {
+      // Игнорируем, если браузер запретил AudioContext
     }
   }, []);
 
-  const loadAndPlay = useCallback(async (track: Track) => {
-    setError(null);
-    setIsLoading(true);
-    setCurrentTime(0);
-    if (track.duration) setDuration(track.duration);
-    syncBackgroundAudio(true);
+  const stopYoutube = useCallback(() => {
+    try {
+      ytPlayerRef.current?.stopVideo?.();
+    } catch {
+      // игнорируем
+    }
+  }, []);
 
-    let videoId = track.id;
+  const startYoutubeFallback = useCallback((rawId: string) => {
+    modeRef.current = 'youtube';
+    const cleanId = rawId.replace('/api/stream/', '').split('?')[0];
+    if (ytReadyRef.current && ytPlayerRef.current?.loadVideoById) {
+      ytPlayerRef.current.loadVideoById({ videoId: cleanId, startSeconds: 0 });
+    } else {
+      pendingYtIdRef.current = cleanId;
+    }
+  }, []);
 
-    if (videoId.startsWith('ytq:')) {
-      const cached = resolvedIdsCache.get(videoId);
-      if (cached) {
-        videoId = cached.id;
-      } else {
-        try {
-          const encodedQuery = videoId.split(':').slice(2).join(':');
-          const res = await fetch(`/api/search?q=${encodedQuery}`);
-          const data = await res.json();
-          const best = data?.tracks?.[0];
-          if (!best?.id) throw new Error('Трек не найден');
+  const playStream = useCallback(
+    async (input: string | Track) => {
+      if (!input) return;
+      const url =
+        typeof input === 'string'
+          ? input
+          : input.id.startsWith('blob:') || input.id.startsWith('/') || input.id.startsWith('http')
+            ? input.id
+            : `/api/stream/${encodeURIComponent(input.id)}`;
 
-          resolvedIdsCache.set(track.id, {
-            id: best.id,
-            thumbnail: best.thumbnail,
-            duration: best.duration || 0,
-          });
-          videoId = best.id;
-          if (!track.thumbnail && best.thumbnail) track.thumbnail = best.thumbnail;
-          if (best.duration) setDuration(best.duration);
-        } catch {
+      setError(null);
+      setIsLoading(true);
+      setCurrentTime(0);
+      stopYoutube();
+      modeRef.current = 'native';
+
+      const el = audioRef.current;
+      if (!el) return;
+
+      if (audioCtxRef.current?.state === 'suspended') {
+        audioCtxRef.current.resume().catch(() => {});
+      }
+
+      el.src = url;
+      el.load();
+
+      try {
+        await el.play();
+        setIsPlaying(true);
+        setIsLoading(false);
+      } catch {
+        // Если прямой поток не запустился, откатываемся на YouTube IFrame
+        if (!url.startsWith('blob:')) {
+          startYoutubeFallback(url);
+        } else {
           setIsLoading(false);
-          setError('Не удалось найти трек');
-          return;
+          setIsPlaying(false);
         }
       }
-    }
-
-    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator && track.title) {
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: track.title,
-        artist: track.artist || 'Liquid Wave',
-        album: 'Liquid Wave',
-        artwork: track.thumbnail ? [{ src: track.thumbnail, sizes: '320x180', type: 'image/jpeg' }] : [],
-      });
-    }
-
-    if (readyRef.current && playerRef.current?.loadVideoById) {
-      playerRef.current.loadVideoById({ videoId, startSeconds: 0 });
-      setTimeout(() => {
-        if (shouldBePlayingRef.current) playerRef.current?.playVideo?.();
-      }, 250);
-    } else {
-      pendingRef.current = videoId;
-    }
-  }, [syncBackgroundAudio]);
+    },
+    [stopYoutube, startYoutubeFallback]
+  );
 
   const playNext = useCallback(() => {
     if (onEndedRef.current) {
@@ -170,63 +164,123 @@ export function useAudioEngine(onEndedOrOptions?: any) {
     }
     const { queue: q, currentIndex: idx } = stateRef.current;
     if (idx + 1 < q.length) {
+      const next = q[idx + 1];
       setCurrentIndex(idx + 1);
-      loadAndPlay(q[idx + 1]);
+      playStream(next);
     } else {
       setIsPlaying(false);
-      syncBackgroundAudio(false);
-      audioRef.current?.dispatchEvent?.(new Event('ended'));
     }
-  }, [loadAndPlay, syncBackgroundAudio]);
+  }, [playStream]);
 
   const playPrev = useCallback(() => {
-    const { queue: q, currentIndex: idx } = stateRef.current;
-    if (playerRef.current?.getCurrentTime?.() > 3) {
-      playerRef.current.seekTo(0, true);
+    const el = audioRef.current;
+    if (modeRef.current === 'native' && el && el.currentTime > 3) {
+      el.currentTime = 0;
       setCurrentTime(0);
       return;
     }
+    const { queue: q, currentIndex: idx } = stateRef.current;
     if (q.length > 0) {
       const prevIdx = Math.max(0, idx - 1);
       setCurrentIndex(prevIdx);
-      loadAndPlay(q[prevIdx]);
+      playStream(q[prevIdx]);
     }
-  }, [loadAndPlay]);
+  }, [playStream]);
 
+  // Слушатели нативного <audio> (работают даже с выключенным экраном iPhone/Android)
+  useEffect(() => {
+    const el = audioRef.current;
+    if (!el) return;
+
+    const onPlay = () => {
+      if (modeRef.current !== 'native') return;
+      setIsPlaying(true);
+      setIsLoading(false);
+    };
+    const onPause = () => {
+      if (modeRef.current !== 'native') return;
+      setIsPlaying(false);
+    };
+    const onWaiting = () => {
+      if (modeRef.current !== 'native') return;
+      setIsLoading(true);
+    };
+    const onCanPlay = () => {
+      if (modeRef.current !== 'native') return;
+      setIsLoading(false);
+      if (isFinite(el.duration) && el.duration > 0) {
+        setDuration(el.duration);
+      }
+    };
+    const onTimeUpdate = () => {
+      if (modeRef.current !== 'native') return;
+      setCurrentTime(el.currentTime || 0);
+      if (isFinite(el.duration) && el.duration > 0) {
+        setDuration(el.duration);
+      }
+    };
+    const onEnded = () => {
+      if (modeRef.current !== 'native') return;
+      playNext();
+    };
+    const onError = () => {
+      if (modeRef.current !== 'native') return;
+      const src = el.getAttribute('src') || '';
+      if (src && !src.startsWith('blob:')) {
+        startYoutubeFallback(src);
+      } else {
+        setIsLoading(false);
+        setIsPlaying(false);
+      }
+    };
+
+    el.addEventListener('play', onPlay);
+    el.addEventListener('pause', onPause);
+    el.addEventListener('waiting', onWaiting);
+    el.addEventListener('canplay', onCanPlay);
+    el.addEventListener('timeupdate', onTimeUpdate);
+    el.addEventListener('ended', onEnded);
+    el.addEventListener('error', onError);
+
+    return () => {
+      el.removeEventListener('play', onPlay);
+      el.removeEventListener('pause', onPause);
+      el.removeEventListener('waiting', onWaiting);
+      el.removeEventListener('canplay', onCanPlay);
+      el.removeEventListener('timeupdate', onTimeUpdate);
+      el.removeEventListener('ended', onEnded);
+      el.removeEventListener('error', onError);
+    };
+  }, [playNext, startYoutubeFallback]);
+
+  // Резервный YouTube IFrame API (на случай блокировки потока)
   useEffect(() => {
     const init = () => {
-      if (playerRef.current || !document.getElementById('yt-global-player')) return;
-      playerRef.current = new window.YT.Player('yt-global-player', {
+      if (ytPlayerRef.current || !document.getElementById('yt-global-player')) return;
+      ytPlayerRef.current = new window.YT.Player('yt-global-player', {
         height: '180',
         width: '320',
-        playerVars: { autoplay: 1, controls: 0, disablekb: 1, fs: 0, modestbranding: 1, playsinline: 1, rel: 0 },
+        playerVars: { autoplay: 1, controls: 0, disablekb: 1, fs: 0, playsinline: 1, rel: 0 },
         events: {
           onReady: (e: any) => {
-            readyRef.current = true;
-            e.target.setVolume(100);
-            if (pendingRef.current) {
-              const id = pendingRef.current;
-              pendingRef.current = null;
+            ytReadyRef.current = true;
+            e.target.setVolume(volume);
+            if (pendingYtIdRef.current) {
+              const id = pendingYtIdRef.current;
+              pendingYtIdRef.current = null;
               e.target.loadVideoById(id);
             }
           },
           onStateChange: (e: any) => {
+            if (modeRef.current !== 'youtube') return;
             if (e.data === 1) {
-              errStreakRef.current = 0;
               setIsPlaying(true);
               setIsLoading(false);
-              syncBackgroundAudio(true);
               const d = e.target.getDuration?.();
               if (d > 0) setDuration(d);
             } else if (e.data === 2) {
-              // Если экран заблокировали, браузер сам шлёт паузу — сразу возобновляем
-              if (document.hidden && shouldBePlayingRef.current) {
-                setTimeout(() => playerRef.current?.playVideo?.(), 150);
-                return;
-              }
               setIsPlaying(false);
               setIsLoading(false);
-              syncBackgroundAudio(false);
             } else if (e.data === 3) {
               setIsLoading(true);
             } else if (e.data === 0) {
@@ -235,14 +289,9 @@ export function useAudioEngine(onEndedOrOptions?: any) {
             }
           },
           onError: () => {
+            if (modeRef.current !== 'youtube') return;
             setIsLoading(false);
-            errStreakRef.current += 1;
-            if (errStreakRef.current < 3) {
-              setTimeout(playNext, 500);
-            } else {
-              setError('Трек недоступен');
-              errStreakRef.current = 0;
-            }
+            setError('Трек недоступен');
           },
         },
       });
@@ -264,122 +313,170 @@ export function useAudioEngine(onEndedOrOptions?: any) {
       }
     }
 
-    const handleVisibility = () => {
-      if (document.hidden && shouldBePlayingRef.current) {
-        setTimeout(() => playerRef.current?.playVideo?.(), 200);
-        setTimeout(() => playerRef.current?.playVideo?.(), 600);
-      }
-    };
-    document.addEventListener('visibilitychange', handleVisibility);
-
     const timer = setInterval(() => {
-      if (readyRef.current && playerRef.current?.getPlayerState?.() === 1) {
-        setCurrentTime(playerRef.current.getCurrentTime?.() || 0);
-        const d = playerRef.current.getDuration?.() || 0;
+      if (modeRef.current === 'youtube' && ytReadyRef.current && ytPlayerRef.current?.getPlayerState?.() === 1) {
+        setCurrentTime(ytPlayerRef.current.getCurrentTime?.() || 0);
+        const d = ytPlayerRef.current.getDuration?.() || 0;
         if (d > 0) setDuration(d);
       }
     }, 250);
 
-    return () => {
-      clearInterval(timer);
-      document.removeEventListener('visibilitychange', handleVisibility);
-    };
-  }, [playNext, syncBackgroundAudio]);
+    return () => clearInterval(timer);
+  }, [playNext, volume]);
 
-  const playStream = useCallback((input: string | Track, ..._rest: any[]) => {
-    if (!input) return;
-    const track: Track =
-      typeof input === 'string'
-        ? {
-            id: input.includes('/api/stream/') ? input.split('/api/stream/')[1].split('?')[0] : input,
-            title: '',
-            artist: '',
-            thumbnail: '',
-          }
-        : input;
-    errStreakRef.current = 0;
-    loadAndPlay(track);
-  }, [loadAndPlay]);
+  const playTrack = useCallback(
+    (track: Track, newQueue?: Track[]) => {
+      if (newQueue?.length) {
+        setQueue(newQueue);
+        const idx = newQueue.findIndex((t) => t.id === track.id);
+        setCurrentIndex(idx >= 0 ? idx : 0);
+      }
+      playStream(track);
+    },
+    [playStream]
+  );
 
-  const playTrack = useCallback((track: Track, newQueue?: Track[]) => {
-    errStreakRef.current = 0;
-    if (newQueue?.length) {
-      setQueue(newQueue);
-      const idx = newQueue.findIndex((t) => t.id === track.id);
-      setCurrentIndex(idx >= 0 ? idx : 0);
+  const togglePlay = useCallback(() => {
+    if (modeRef.current === 'native') {
+      const el = audioRef.current;
+      if (!el) return;
+      if (el.paused) {
+        if (audioCtxRef.current?.state === 'suspended') {
+          audioCtxRef.current.resume().catch(() => {});
+        }
+        el.play().catch(() => {});
+      } else {
+        el.pause();
+      }
+      return;
     }
-    loadAndPlay(track);
-  }, [loadAndPlay]);
 
-  const togglePlay = useCallback((..._args: any[]) => {
-    if (!readyRef.current || !playerRef.current) return;
-    if (isPlaying) {
-      syncBackgroundAudio(false);
-      playerRef.current.pauseVideo();
+    if (!ytReadyRef.current || !ytPlayerRef.current) return;
+    if (isPlaying) ytPlayerRef.current.pauseVideo();
+    else ytPlayerRef.current.playVideo();
+  }, [isPlaying]);
+
+  const pause = useCallback(() => {
+    if (modeRef.current === 'native') {
+      audioRef.current?.pause();
     } else {
-      syncBackgroundAudio(true);
-      playerRef.current.playVideo();
+      ytPlayerRef.current?.pauseVideo?.();
     }
-  }, [isPlaying, syncBackgroundAudio]);
+  }, []);
 
   const seekTo = useCallback((sec: number) => {
-    if (!readyRef.current || !playerRef.current) return;
-    playerRef.current.seekTo(sec, true);
+    if (modeRef.current === 'native') {
+      const el = audioRef.current;
+      if (!el) return;
+      el.currentTime = sec;
+      setCurrentTime(sec);
+      return;
+    }
+    if (!ytReadyRef.current || !ytPlayerRef.current) return;
+    ytPlayerRef.current.seekTo(sec, true);
     setCurrentTime(sec);
   }, []);
 
-  const setVolume = useCallback((val: number) => {
-    const v = Math.max(0, Math.min(100, val));
-    setVolumeState(v);
-    if (readyRef.current && playerRef.current) {
-      playerRef.current.setVolume(v);
-      if (v > 0 && isMuted) {
-        playerRef.current.unMute();
-        setIsMuted(false);
+  const setVolume = useCallback(
+    (val: number) => {
+      const v = Math.max(0, Math.min(100, val));
+      setVolumeState(v);
+      if (audioRef.current) {
+        audioRef.current.volume = v / 100;
+        if (v > 0 && audioRef.current.muted) {
+          audioRef.current.muted = false;
+          setIsMuted(false);
+        }
       }
+      if (ytReadyRef.current && ytPlayerRef.current) {
+        ytPlayerRef.current.setVolume(v);
+        if (v > 0 && isMuted) {
+          ytPlayerRef.current.unMute();
+          setIsMuted(false);
+        }
+      }
+    },
+    [isMuted]
+  );
+
+  const toggleMute = useCallback(() => {
+    const nextMute = !isMuted;
+    setIsMuted(nextMute);
+    if (audioRef.current) audioRef.current.muted = nextMute;
+    if (ytReadyRef.current && ytPlayerRef.current) {
+      if (nextMute) ytPlayerRef.current.mute();
+      else ytPlayerRef.current.unMute();
     }
   }, [isMuted]);
 
-  const toggleMute = useCallback((..._args: any[]) => {
-    if (!readyRef.current || !playerRef.current) return;
-    if (isMuted) {
-      playerRef.current.unMute();
-      setIsMuted(false);
-    } else {
-      playerRef.current.mute();
-      setIsMuted(true);
-    }
-  }, [isMuted]);
+  const setBandGain = useCallback(
+    (idx: number, gain: number) => {
+      ensureEqGraph();
+      setActivePreset('custom');
+      setEqGains((prev) => {
+        const next = prev.map((g, i) => (i === idx ? gain : g));
+        filtersRef.current.forEach((f, i) => {
+          if (f) f.gain.value = next[i] || 0;
+        });
+        return next;
+      });
+    },
+    [ensureEqGraph]
+  );
 
-  const setBandGain = useCallback((idx: number, gain: number) => {
-    setActivePreset('custom');
-    setEqGains((prev) => prev.map((g, i) => (i === idx ? gain : g)));
-  }, []);
-
-  const applyPreset = useCallback((key: string) => {
-    if (!EQ_PRESETS[key]) return;
-    setActivePreset(key);
-    setEqGains([...EQ_PRESETS[key].gains]);
-  }, []);
+  const applyPreset = useCallback(
+    (key: string) => {
+      if (!EQ_PRESETS[key]) return;
+      if (key !== 'flat') ensureEqGraph();
+      const gains = [...EQ_PRESETS[key].gains];
+      setActivePreset(key);
+      setEqGains(gains);
+      filtersRef.current.forEach((f, i) => {
+        if (f) f.gain.value = gains[i] || 0;
+      });
+    },
+    [ensureEqGraph]
+  );
 
   return {
-    audioRef, currentTrack, queue, setQueue, isPlaying, isLoading, isBuffering: isLoading,
-    currentTime, progress: currentTime, duration, volume, isMuted, error,
-    eqGains, activePreset, setBandGain, updateBandGain: setBandGain, setEqGain: setBandGain,
-    applyPreset, applyEqPreset: applyPreset, resetEq: (..._args: any[]) => applyPreset('flat'),
-    playStream, playTrack,
-    play: (...args: any[]) => {
-      if (args[0]) return playStream(args[0]);
-      syncBackgroundAudio(true);
-      playerRef.current?.playVideo?.();
+    audioRef,
+    currentTrack,
+    queue,
+    setQueue,
+    isPlaying,
+    isLoading,
+    isBuffering: isLoading,
+    currentTime,
+    progress: currentTime,
+    duration,
+    volume,
+    isMuted,
+    error,
+    eqGains,
+    activePreset,
+    setBandGain,
+    updateBandGain: setBandGain,
+    setEqGain: setBandGain,
+    applyPreset,
+    applyEqPreset: applyPreset,
+    resetEq: () => applyPreset('flat'),
+    playStream,
+    playTrack,
+    play: (arg?: any) => {
+      if (arg) return playStream(arg);
+      if (modeRef.current === 'native') audioRef.current?.play().catch(() => {});
+      else ytPlayerRef.current?.playVideo?.();
     },
-    pause: (..._args: any[]) => {
-      syncBackgroundAudio(false);
-      playerRef.current?.pauseVideo?.();
-    },
-    togglePlay, toggle: togglePlay,
-    playNext: (..._args: any[]) => playNext(), nextTrack: (..._args: any[]) => playNext(),
-    playPrev: (..._args: any[]) => playPrev(), prevTrack: (..._args: any[]) => playPrev(),
-    seekTo, seek: seekTo, setVolume, toggleMute,
+    pause,
+    togglePlay,
+    toggle: togglePlay,
+    playNext,
+    nextTrack: playNext,
+    playPrev,
+    prevTrack: playPrev,
+    seekTo,
+    seek: seekTo,
+    setVolume,
+    toggleMute,
   };
 }

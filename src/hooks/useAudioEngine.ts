@@ -50,7 +50,6 @@ export function useAudioEngine(onEndedOrOptions?: any) {
   const lastUrlRef = useRef<string>('');
   const fallbackTimerRef = useRef<any>(null);
 
-  // Отслеживаем прогресс, чтобы перехватывать конец трека через loop=true без закрытия аудиосессии iOS
   const maxReachedTimeRef = useRef<number>(0);
   const userSeekingRef = useRef<boolean>(false);
   const trackTransitionLockRef = useRef<boolean>(false);
@@ -80,8 +79,8 @@ export function useAudioEngine(onEndedOrOptions?: any) {
   const [activePreset, setActivePreset] = useState('flat');
 
   const currentTrack = currentIndex >= 0 && currentIndex < queue.length ? queue[currentIndex] : null;
-  const stateRef = useRef({ queue, currentIndex });
-  stateRef.current = { queue, currentIndex };
+  const stateRef = useRef({ queue, currentIndex, volume });
+  stateRef.current = { queue, currentIndex, volume };
 
   const clearFallbackTimer = () => {
     if (fallbackTimerRef.current) {
@@ -171,8 +170,11 @@ export function useAudioEngine(onEndedOrOptions?: any) {
     }
 
     if (ytReadyRef.current && ytPlayerRef.current?.loadVideoById) {
+      ytPlayerRef.current.unMute?.();
+      ytPlayerRef.current.setVolume?.(stateRef.current.volume);
       ytPlayerRef.current.loadVideoById({ videoId: cleanId, startSeconds: 0 });
       setTimeout(() => {
+        ytPlayerRef.current?.unMute?.();
         ytPlayerRef.current?.playVideo?.();
       }, 200);
     } else {
@@ -205,20 +207,20 @@ export function useAudioEngine(onEndedOrOptions?: any) {
       const el = audioRef.current;
       if (!el) return;
 
-      // Держим loop = true, чтобы iOS не закрывал системную аудиосессию на заблокированном экране
       el.loop = true;
+      el.muted = false;
+      el.volume = Math.max(0.01, stateRef.current.volume / 100);
 
       if (audioCtxRef.current?.state === 'suspended') {
         audioCtxRef.current.resume().catch(() => {});
       }
 
-      // Даём серверу до 12 секунд на прогрев потока (yt-dlp / SoundCloud), прежде чем откатываться на YouTube IFrame
       if (!url.startsWith('blob:')) {
         fallbackTimerRef.current = setTimeout(() => {
           if (modeRef.current === 'native' && el.paused) {
             startYoutubeFallback(url);
           }
-        }, 12000);
+        }, 10000);
       }
 
       el.src = url;
@@ -285,7 +287,6 @@ export function useAudioEngine(onEndedOrOptions?: any) {
       if (trackTransitionLockRef.current) return;
       trackTransitionLockRef.current = true;
       maxReachedTimeRef.current = 0;
-      // Ставим на паузу (это сохраняет аудиосессию iOS открытой) и сразу запускаем следующий трек
       el.pause();
       playNext();
     };
@@ -293,6 +294,7 @@ export function useAudioEngine(onEndedOrOptions?: any) {
     const onPlay = () => {
       if (modeRef.current !== 'native') return;
       configureIosAudioSession();
+      el.muted = false;
       clearFallbackTimer();
       setIsPlaying(true);
       setIsLoading(false);
@@ -301,6 +303,7 @@ export function useAudioEngine(onEndedOrOptions?: any) {
     const onPlaying = () => {
       if (modeRef.current !== 'native') return;
       configureIosAudioSession();
+      el.muted = false;
       setIsPlaying(true);
       setIsLoading(false);
       if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
@@ -340,7 +343,6 @@ export function useAudioEngine(onEndedOrOptions?: any) {
 
     const onSeeking = () => {
       if (modeRef.current !== 'native') return;
-      // Если трек доиграл до конца и из-за loop=true перепрыгнул в 0:00
       if (
         !userSeekingRef.current &&
         maxReachedTimeRef.current > 10 &&
@@ -361,7 +363,6 @@ export function useAudioEngine(onEndedOrOptions?: any) {
       const cur = el.currentTime || 0;
       const dur = isFinite(el.duration) && el.duration > 0 ? el.duration : 0;
 
-      // Запасной перехват петли в 0:00 для iOS Safari
       if (
         !userSeekingRef.current &&
         maxReachedTimeRef.current > 10 &&
@@ -441,6 +442,7 @@ export function useAudioEngine(onEndedOrOptions?: any) {
         events: {
           onReady: (e: any) => {
             ytReadyRef.current = true;
+            e.target.unMute?.();
             e.target.setVolume(volume);
             if (pendingYtIdRef.current) {
               const id = pendingYtIdRef.current;
@@ -451,6 +453,8 @@ export function useAudioEngine(onEndedOrOptions?: any) {
           onStateChange: (e: any) => {
             if (modeRef.current !== 'youtube') return;
             if (e.data === 1) {
+              e.target.unMute?.();
+              e.target.setVolume?.(stateRef.current.volume);
               setIsPlaying(true);
               setIsLoading(false);
               const d = e.target.getDuration?.();
@@ -535,6 +539,7 @@ export function useAudioEngine(onEndedOrOptions?: any) {
       }
 
       if (el.paused) {
+        el.muted = false;
         if (audioCtxRef.current?.state === 'suspended') {
           audioCtxRef.current.resume().catch(() => {});
         }
@@ -558,6 +563,7 @@ export function useAudioEngine(onEndedOrOptions?: any) {
       ytPlayerRef.current.pauseVideo();
       setIsPlaying(false);
     } else {
+      ytPlayerRef.current.unMute?.();
       ytPlayerRef.current.playVideo();
       setIsPlaying(true);
     }

@@ -1,14 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
-import path from 'path';
-import fs from 'fs';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const execFileAsync = promisify(execFile);
 const streamUrlCache = new Map<string, { url: string; mimeType: string; expiresAt: number }>();
+let cachedScClientId: { id: string; expiresAt: number } | null = null;
 
 function safeDecode(value: string): string {
   try {
@@ -18,50 +14,101 @@ function safeDecode(value: string): string {
   }
 }
 
-function getYtDlpBinary(): string {
-  const binName = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
-  const localBin = path.join(process.cwd(), 'node_modules', 'youtube-dl-exec', 'bin', binName);
-  return fs.existsSync(localBin) ? localBin : binName;
-}
-
-function guessMimeType(streamUrl: string): string {
-  const lower = streamUrl.toLowerCase();
-  if (lower.includes('.mp3') || lower.includes('mp3')) return 'audio/mpeg';
-  if (lower.includes('mime=audio%2fwebm') || lower.includes('.webm')) return 'audio/webm';
-  return 'audio/mp4';
-}
-
-async function fetchViaYtDlp(target: string, isYoutube: boolean): Promise<{ url: string; mimeType: string }> {
-  const bin = getYtDlpBinary();
-  const args = [
-    '-g',
-    '--no-playlist',
-    '--no-warnings',
-    '--socket-timeout',
-    '5',
-    '-f',
-    'bestaudio[protocol^=http][protocol!=m3u8_native][protocol!=m3u8]/bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio',
-  ];
-
-  if (isYoutube) {
-    args.push('--extractor-args', 'youtube:player_client=tv_embedded,web_safari,android_vr');
+async function getSoundCloudClientId(): Promise<string> {
+  if (cachedScClientId && cachedScClientId.expiresAt > Date.now()) {
+    return cachedScClientId.id;
   }
 
-  args.push(target);
+  const pageRes = await fetch('https://soundcloud.com', {
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    },
+  });
+  const html = await pageRes.text();
+  const scriptUrls = [...html.matchAll(/<script[^>]+src="(https:\/\/a-v2\.sndcdn\.com\/assets\/[^"]+\.js)"/g)]
+    .map((m) => m[1])
+    .slice(-5);
 
-  const { stdout } = await execFileAsync(bin, args, { timeout: 9000 });
-  const streamUrl = stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => line.startsWith('http'));
+  for (const scriptUrl of scriptUrls.reverse()) {
+    try {
+      const jsRes = await fetch(scriptUrl);
+      const js = await jsRes.text();
+      const match =
+        js.match(/client_id\s*[:=]\s*["']([a-zA-Z0-9]{32})["']/) ||
+        js.match(/client_id=([a-zA-Z0-9]{32})/);
+      if (match?.[1]) {
+        cachedScClientId = {
+          id: match[1],
+          expiresAt: Date.now() + 1000 * 60 * 60 * 12,
+        };
+        return match[1];
+      }
+    } catch {
+      // проверяем следующий бандл
+    }
+  }
 
-  if (!streamUrl) throw new Error('yt-dlp returned empty URL');
-  return { url: streamUrl, mimeType: guessMimeType(streamUrl) };
+  throw new Error('SoundCloud client_id not found');
+}
+
+async function fetchFromSoundCloudQuery(query: string): Promise<{ url: string; mimeType: string }> {
+  const clientId = await getSoundCloudClientId();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+
+  try {
+    const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=8`;
+    const res = await fetch(searchUrl, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      },
+    });
+    if (!res.ok) throw new Error('SC search HTTP ' + res.status);
+
+    const data = await res.json();
+    const items: any[] = Array.isArray(data?.collection) ? data.collection : [];
+
+    // Выбираем полные треки (не 30-секундные SNIP-превью) с прямым progressive MP3
+    const candidates = items
+      .filter((item) => Array.isArray(item?.media?.transcodings))
+      .sort((a, b) => {
+        const aFull = a.policy !== 'SNIP' && (a.duration || 0) > 45000 ? 1 : 0;
+        const bFull = b.policy !== 'SNIP' && (b.duration || 0) > 45000 ? 1 : 0;
+        return bFull - aFull;
+      });
+
+    for (const track of candidates) {
+      const progressive = track.media.transcodings.find(
+        (t: any) => t?.format?.protocol === 'progressive' && t?.url
+      );
+      if (!progressive) continue;
+
+      const streamInfoRes = await fetch(`${progressive.url}?client_id=${clientId}`, {
+        signal: controller.signal,
+      });
+      if (!streamInfoRes.ok) continue;
+
+      const streamInfo = await streamInfoRes.json();
+      if (streamInfo?.url) {
+        return {
+          url: streamInfo.url,
+          mimeType: 'audio/mpeg',
+        };
+      }
+    }
+
+    throw new Error('No progressive MP3 stream on SoundCloud');
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function fetchYoutubeTitleOEmbed(videoId: string): Promise<string> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3000);
+  const timer = setTimeout(() => controller.abort(), 3500);
   try {
     const res = await fetch(
       `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
@@ -71,21 +118,21 @@ async function fetchYoutubeTitleOEmbed(videoId: string): Promise<string> {
     const data = await res.json();
     const title = String(data?.title || '').trim();
     const author = String(data?.author_name || '').replace(/\s*-\s*Topic$/i, '').trim();
-    if (!title) throw new Error('Empty oEmbed title');
+    if (!title) throw new Error('Empty title');
     return author && !title.toLowerCase().includes(author.toLowerCase())
-      ? `${author} - ${title}`
+      ? `${author} ${title}`
       : title;
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function fetchViaSoundCloudByVideoId(videoId: string): Promise<{ url: string; mimeType: string }> {
+async function fetchFromSoundCloudByVideoId(videoId: string): Promise<{ url: string; mimeType: string }> {
   const title = await fetchYoutubeTitleOEmbed(videoId);
-  return fetchViaYtDlp(`scsearch1:${title}`, false);
+  return fetchFromSoundCloudQuery(title);
 }
 
-async function fetchInnerTubeOne(
+async function fetchInnerTubeMp4(
   videoId: string,
   clientName: string,
   clientVersion: string,
@@ -124,19 +171,20 @@ async function fetchInnerTubeOne(
       ...(data?.streamingData?.formats || []),
     ];
 
-    const audioFormats = formats
-      .filter((f: any) => f.url && typeof f.mimeType === 'string' && f.mimeType.startsWith('audio/'))
-      .sort((a: any, b: any) => {
-        const aMp4 = a.mimeType.includes('mp4') ? 1 : 0;
-        const bMp4 = b.mimeType.includes('mp4') ? 1 : 0;
-        if (aMp4 !== bMp4) return bMp4 - aMp4;
-        return (b.bitrate || 0) - (a.bitrate || 0);
-      });
+    // Строго audio/mp4 (m4a), чтобы iPhone Safari гарантированно декодировал звук
+    const mp4Audio = formats
+      .filter(
+        (f: any) =>
+          f.url &&
+          typeof f.mimeType === 'string' &&
+          f.mimeType.toLowerCase().includes('audio/mp4')
+      )
+      .sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0));
 
-    if (!audioFormats[0]?.url) throw new Error('No audio format');
+    if (!mp4Audio[0]?.url) throw new Error('No audio/mp4 format');
     return {
-      url: audioFormats[0].url,
-      mimeType: audioFormats[0].mimeType.split(';')[0] || 'audio/mp4',
+      url: mp4Audio[0].url,
+      mimeType: 'audio/mp4',
     };
   } finally {
     clearTimeout(timer);
@@ -154,27 +202,23 @@ async function getAudioSource(rawId: string): Promise<{ url: string; mimeType: s
   if (rawId.startsWith('ytq:')) {
     const query = safeDecode(rawId.split(':').slice(2).join(':')).trim();
     if (!query) throw new Error('Empty track query');
-    resolved = await Promise.any([
-      fetchViaYtDlp(`scsearch1:${query}`, false),
-      fetchViaYtDlp(`ytsearch1:${query}`, true),
-    ]);
+    resolved = await fetchFromSoundCloudQuery(query);
   } else {
     resolved = await Promise.any([
-      fetchViaYtDlp(`https://www.youtube.com/watch?v=${rawId}`, true),
-      fetchViaSoundCloudByVideoId(rawId),
-      fetchInnerTubeOne(
-        rawId,
-        'ANDROID_VR',
-        '1.60.19',
-        'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
-        { deviceMake: 'Oculus', deviceModel: 'Quest 3', osName: 'Android', osVersion: '12L', androidSdkVersion: 32 }
-      ),
-      fetchInnerTubeOne(
+      fetchFromSoundCloudByVideoId(rawId),
+      fetchInnerTubeMp4(
         rawId,
         'IOS',
         '19.45.4',
         'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
         { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' }
+      ),
+      fetchInnerTubeMp4(
+        rawId,
+        'ANDROID_VR',
+        '1.60.19',
+        'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+        { deviceMake: 'Oculus', deviceModel: 'Quest 3', osName: 'Android', osVersion: '12L', androidSdkVersion: 32 }
       ),
     ]);
   }
@@ -182,7 +226,7 @@ async function getAudioSource(rawId: string): Promise<{ url: string; mimeType: s
   streamUrlCache.set(rawId, {
     url: resolved.url,
     mimeType: resolved.mimeType,
-    expiresAt: Date.now() + 1000 * 60 * 90,
+    expiresAt: Date.now() + 1000 * 60 * 60,
   });
 
   return resolved;
@@ -192,80 +236,3 @@ async function handleStream(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> },
   isHead: boolean
-) {
-  try {
-    const { id } = await params;
-    const rawId = safeDecode(id || '').trim();
-    if (!rawId) {
-      return NextResponse.json({ error: 'Missing track id' }, { status: 400 });
-    }
-
-    const source = await getAudioSource(rawId);
-
-    if (req.nextUrl.searchParams.get('prefetch') === '1') {
-      return NextResponse.json({ ok: true });
-    }
-
-    const rangeHeader = req.headers.get('range');
-    const upstreamHeaders: Record<string, string> = {
-      'User-Agent':
-        'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1',
-    };
-    if (rangeHeader) {
-      upstreamHeaders['Range'] = rangeHeader;
-    }
-
-    let upstream = await fetch(source.url, {
-      method: isHead ? 'HEAD' : 'GET',
-      headers: upstreamHeaders,
-    });
-
-    if (upstream.status === 403 || upstream.status === 410) {
-      streamUrlCache.delete(rawId);
-      const fresh = await getAudioSource(rawId);
-      upstream = await fetch(fresh.url, {
-        method: isHead ? 'HEAD' : 'GET',
-        headers: upstreamHeaders,
-      });
-    }
-
-    if (!upstream.ok && upstream.status !== 206) {
-      return NextResponse.json({ error: 'Upstream stream failed' }, { status: 502 });
-    }
-
-    const responseHeaders = new Headers();
-    responseHeaders.set('Content-Type', upstream.headers.get('content-type') || source.mimeType);
-    responseHeaders.set('Accept-Ranges', 'bytes');
-    responseHeaders.set('Cache-Control', 'no-store');
-
-    const contentLength = upstream.headers.get('content-length');
-    if (contentLength) responseHeaders.set('Content-Length', contentLength);
-
-    const contentRange = upstream.headers.get('content-range');
-    if (contentRange) responseHeaders.set('Content-Range', contentRange);
-
-    return new NextResponse(isHead ? null : upstream.body, {
-      status: upstream.status,
-      headers: responseHeaders,
-    });
-  } catch (err: any) {
-    return NextResponse.json(
-      { error: err?.message || 'Failed to stream audio' },
-      { status: 500 }
-    );
-  }
-}
-
-export async function GET(
-  req: NextRequest,
-  context: { params: Promise<{ id: string }> }
-) {
-  return handleStream(req, context, false);
-}
-
-export async function HEAD(
-  req: NextRequest,
-  context: { params: Promise<{ id: string }> }
-) {
-  return handleStream(req, context, true);
-}

@@ -1,39 +1,88 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import path from 'path';
+import fs from 'fs';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+const execFileAsync = promisify(execFile);
 const streamUrlCache = new Map<string, { url: string; mimeType: string; expiresAt: number }>();
 
-const PIPED_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
-  'https://pipedapi.adminforge.de',
-  'https://api.piped.private.coffee',
-  'https://pipedapi.drgns.space',
-];
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
 
-const INVIDIOUS_INSTANCES = [
-  'https://inv.nadeko.net',
-  'https://invidious.nerdvpn.de',
-  'https://yt.artemislena.eu',
-];
+function getYtDlpBinary(): string {
+  const binName = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
+  const localBin = path.join(process.cwd(), 'node_modules', 'youtube-dl-exec', 'bin', binName);
+  return fs.existsSync(localBin) ? localBin : binName;
+}
 
-async function resolveYtqId(rawId: string): Promise<string> {
-  if (!rawId.startsWith('ytq:')) return rawId;
-  const query = decodeURIComponent(rawId.split(':').slice(2).join(':'));
-  const res = await fetch(
-    `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`,
-    {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      },
-    }
-  );
-  const html = await res.text();
-  const match = html.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
-  if (!match?.[1]) throw new Error('Track not found');
-  return match[1];
+function guessMimeType(streamUrl: string): string {
+  const lower = streamUrl.toLowerCase();
+  if (lower.includes('.mp3') || lower.includes('mp3')) return 'audio/mpeg';
+  if (lower.includes('mime=audio%2fwebm') || lower.includes('.webm')) return 'audio/webm';
+  return 'audio/mp4';
+}
+
+async function fetchViaYtDlp(target: string, isYoutube: boolean): Promise<{ url: string; mimeType: string }> {
+  const bin = getYtDlpBinary();
+  const args = [
+    '-g',
+    '--no-playlist',
+    '--no-warnings',
+    '--socket-timeout',
+    '5',
+    '-f',
+    'bestaudio[protocol^=http][protocol!=m3u8_native][protocol!=m3u8]/bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio',
+  ];
+
+  if (isYoutube) {
+    args.push('--extractor-args', 'youtube:player_client=tv_embedded,web_safari,android_vr');
+  }
+
+  args.push(target);
+
+  const { stdout } = await execFileAsync(bin, args, { timeout: 9000 });
+  const streamUrl = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.startsWith('http'));
+
+  if (!streamUrl) throw new Error('yt-dlp returned empty URL');
+  return { url: streamUrl, mimeType: guessMimeType(streamUrl) };
+}
+
+async function fetchYoutubeTitleOEmbed(videoId: string): Promise<string> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
+  try {
+    const res = await fetch(
+      `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
+      { signal: controller.signal }
+    );
+    if (!res.ok) throw new Error('oEmbed failed');
+    const data = await res.json();
+    const title = String(data?.title || '').trim();
+    const author = String(data?.author_name || '').replace(/\s*-\s*Topic$/i, '').trim();
+    if (!title) throw new Error('Empty oEmbed title');
+    return author && !title.toLowerCase().includes(author.toLowerCase())
+      ? `${author} - ${title}`
+      : title;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchViaSoundCloudByVideoId(videoId: string): Promise<{ url: string; mimeType: string }> {
+  const title = await fetchYoutubeTitleOEmbed(videoId);
+  return fetchViaYtDlp(`scsearch1:${title}`, false);
 }
 
 async function fetchInnerTubeOne(
@@ -44,7 +93,7 @@ async function fetchInnerTubeOne(
   extraClient: Record<string, any> = {}
 ): Promise<{ url: string; mimeType: string }> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3500);
+  const timer = setTimeout(() => controller.abort(), 4000);
   try {
     const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
       method: 'POST',
@@ -94,80 +143,43 @@ async function fetchInnerTubeOne(
   }
 }
 
-async function fetchPipedOne(base: string, videoId: string): Promise<{ url: string; mimeType: string }> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3500);
-  try {
-    const res = await fetch(`${base}/streams/${videoId}`, { signal: controller.signal });
-    if (!res.ok) throw new Error('Piped HTTP ' + res.status);
-    const data = await res.json();
-    const streams = (data?.audioStreams || []).sort((a: any, b: any) => {
-      const aM4a = (a.mimeType || '').includes('mp4') ? 1 : 0;
-      const bM4a = (b.mimeType || '').includes('mp4') ? 1 : 0;
-      if (aM4a !== bM4a) return bM4a - aM4a;
-      return (b.bitrate || 0) - (a.bitrate || 0);
-    });
-    if (!streams[0]?.url) throw new Error('No Piped stream');
-    return {
-      url: streams[0].url,
-      mimeType: streams[0].mimeType?.split(';')[0] || 'audio/mp4',
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function fetchInvidiousOne(base: string, videoId: string): Promise<{ url: string; mimeType: string }> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3500);
-  try {
-    const res = await fetch(`${base}/api/v1/videos/${videoId}`, { signal: controller.signal });
-    if (!res.ok) throw new Error('Invidious HTTP ' + res.status);
-    const data = await res.json();
-    const formats = (data?.adaptiveFormats || [])
-      .filter((f: any) => f.url && typeof f.type === 'string' && f.type.startsWith('audio/'))
-      .sort((a: any, b: any) => {
-        const aM4a = a.type.includes('mp4') ? 1 : 0;
-        const bM4a = b.type.includes('mp4') ? 1 : 0;
-        if (aM4a !== bM4a) return bM4a - aM4a;
-        return Number(b.bitrate || 0) - Number(a.bitrate || 0);
-      });
-    if (!formats[0]?.url) throw new Error('No Invidious stream');
-    return {
-      url: formats[0].url,
-      mimeType: formats[0].type.split(';')[0] || 'audio/mp4',
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function getAudioSource(videoId: string): Promise<{ url: string; mimeType: string }> {
-  const cached = streamUrlCache.get(videoId);
+async function getAudioSource(rawId: string): Promise<{ url: string; mimeType: string }> {
+  const cached = streamUrlCache.get(rawId);
   if (cached && cached.expiresAt > Date.now()) {
     return { url: cached.url, mimeType: cached.mimeType };
   }
 
-  const resolved = await Promise.any([
-    fetchInnerTubeOne(
-      videoId,
-      'ANDROID_VR',
-      '1.60.19',
-      'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
-      { deviceMake: 'Oculus', deviceModel: 'Quest 3', osName: 'Android', osVersion: '12L', androidSdkVersion: 32 }
-    ),
-    fetchInnerTubeOne(
-      videoId,
-      'IOS',
-      '19.45.4',
-      'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
-      { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' }
-    ),
-    ...PIPED_INSTANCES.map((base) => fetchPipedOne(base, videoId)),
-    ...INVIDIOUS_INSTANCES.map((base) => fetchInvidiousOne(base, videoId)),
-  ]);
+  let resolved: { url: string; mimeType: string };
 
-  streamUrlCache.set(videoId, {
+  if (rawId.startsWith('ytq:')) {
+    const query = safeDecode(rawId.split(':').slice(2).join(':')).trim();
+    if (!query) throw new Error('Empty track query');
+    resolved = await Promise.any([
+      fetchViaYtDlp(`scsearch1:${query}`, false),
+      fetchViaYtDlp(`ytsearch1:${query}`, true),
+    ]);
+  } else {
+    resolved = await Promise.any([
+      fetchViaYtDlp(`https://www.youtube.com/watch?v=${rawId}`, true),
+      fetchViaSoundCloudByVideoId(rawId),
+      fetchInnerTubeOne(
+        rawId,
+        'ANDROID_VR',
+        '1.60.19',
+        'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+        { deviceMake: 'Oculus', deviceModel: 'Quest 3', osName: 'Android', osVersion: '12L', androidSdkVersion: 32 }
+      ),
+      fetchInnerTubeOne(
+        rawId,
+        'IOS',
+        '19.45.4',
+        'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
+        { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' }
+      ),
+    ]);
+  }
+
+  streamUrlCache.set(rawId, {
     url: resolved.url,
     mimeType: resolved.mimeType,
     expiresAt: Date.now() + 1000 * 60 * 90,
@@ -176,22 +188,22 @@ async function getAudioSource(videoId: string): Promise<{ url: string; mimeType:
   return resolved;
 }
 
-export async function GET(
+async function handleStream(
   req: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
+  { params }: { params: Promise<{ id: string }> },
+  isHead: boolean
 ) {
   try {
     const { id } = await params;
-    const rawId = decodeURIComponent(id || '');
+    const rawId = safeDecode(id || '').trim();
     if (!rawId) {
       return NextResponse.json({ error: 'Missing track id' }, { status: 400 });
     }
 
-    const videoId = await resolveYtqId(rawId);
-    const source = await getAudioSource(videoId);
+    const source = await getAudioSource(rawId);
 
     if (req.nextUrl.searchParams.get('prefetch') === '1') {
-      return NextResponse.json({ ok: true, id: videoId });
+      return NextResponse.json({ ok: true });
     }
 
     const rangeHeader = req.headers.get('range');
@@ -203,12 +215,18 @@ export async function GET(
       upstreamHeaders['Range'] = rangeHeader;
     }
 
-    let upstream = await fetch(source.url, { headers: upstreamHeaders });
+    let upstream = await fetch(source.url, {
+      method: isHead ? 'HEAD' : 'GET',
+      headers: upstreamHeaders,
+    });
 
     if (upstream.status === 403 || upstream.status === 410) {
-      streamUrlCache.delete(videoId);
-      const fresh = await getAudioSource(videoId);
-      upstream = await fetch(fresh.url, { headers: upstreamHeaders });
+      streamUrlCache.delete(rawId);
+      const fresh = await getAudioSource(rawId);
+      upstream = await fetch(fresh.url, {
+        method: isHead ? 'HEAD' : 'GET',
+        headers: upstreamHeaders,
+      });
     }
 
     if (!upstream.ok && upstream.status !== 206) {
@@ -226,7 +244,7 @@ export async function GET(
     const contentRange = upstream.headers.get('content-range');
     if (contentRange) responseHeaders.set('Content-Range', contentRange);
 
-    return new NextResponse(upstream.body, {
+    return new NextResponse(isHead ? null : upstream.body, {
       status: upstream.status,
       headers: responseHeaders,
     });
@@ -236,4 +254,18 @@ export async function GET(
       { status: 500 }
     );
   }
+}
+
+export async function GET(
+  req: NextRequest,
+  context: { params: Promise<{ id: string }> }
+) {
+  return handleStream(req, context, false);
+}
+
+export async function HEAD(
+  req: NextRequest,
+  context: { params: Promise<{ id: string }> }
+) {
+  return handleStream(req, context, true);
 }

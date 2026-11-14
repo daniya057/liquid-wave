@@ -31,6 +31,16 @@ declare global {
 
 const resolvedYtqCache = new Map<string, string>();
 
+function configureIosAudioSession() {
+  if (typeof navigator !== 'undefined' && 'audioSession' in navigator) {
+    try {
+      (navigator as any).audioSession.type = 'playback';
+    } catch {
+      // игнорируем
+    }
+  }
+}
+
 export function useAudioEngine(onEndedOrOptions?: any) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const ytPlayerRef = useRef<any>(null);
@@ -39,6 +49,11 @@ export function useAudioEngine(onEndedOrOptions?: any) {
   const modeRef = useRef<'native' | 'youtube'>('native');
   const lastUrlRef = useRef<string>('');
   const fallbackTimerRef = useRef<any>(null);
+
+  // Отслеживаем прогресс, чтобы перехватывать конец трека через loop=true без закрытия аудиосессии iOS
+  const maxReachedTimeRef = useRef<number>(0);
+  const userSeekingRef = useRef<boolean>(false);
+  const trackTransitionLockRef = useRef<boolean>(false);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
   const filtersRef = useRef<BiquadFilterNode[]>([]);
@@ -118,13 +133,15 @@ export function useAudioEngine(onEndedOrOptions?: any) {
     clearFallbackTimer();
     modeRef.current = 'youtube';
 
-    // Останавливаем нативный тег, чтобы не было двойного звука
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current.removeAttribute('src');
     }
 
-    let cleanId = decodeURIComponent(rawUrl.replace('/api/stream/', '').split('?')[0]);
+    let cleanId = rawUrl.replace('/api/stream/', '').split('?')[0];
+    try {
+      cleanId = decodeURIComponent(cleanId);
+    } catch {}
 
     if (cleanId.startsWith('ytq:')) {
       const cached = resolvedYtqCache.get(cleanId);
@@ -166,6 +183,8 @@ export function useAudioEngine(onEndedOrOptions?: any) {
   const playStream = useCallback(
     async (input: string | Track) => {
       if (!input) return;
+      configureIosAudioSession();
+
       const url =
         typeof input === 'string'
           ? input
@@ -174,6 +193,8 @@ export function useAudioEngine(onEndedOrOptions?: any) {
             : `/api/stream/${encodeURIComponent(input.id)}`;
 
       lastUrlRef.current = url;
+      maxReachedTimeRef.current = 0;
+      trackTransitionLockRef.current = false;
       clearFallbackTimer();
       setError(null);
       setIsLoading(true);
@@ -184,17 +205,20 @@ export function useAudioEngine(onEndedOrOptions?: any) {
       const el = audioRef.current;
       if (!el) return;
 
+      // Держим loop = true, чтобы iOS не закрывал системную аудиосессию на заблокированном экране
+      el.loop = true;
+
       if (audioCtxRef.current?.state === 'suspended') {
         audioCtxRef.current.resume().catch(() => {});
       }
 
-      // Если нативный поток не заиграл за 3.5 секунды — сразу включаем резервный плеер
+      // Даём серверу до 12 секунд на прогрев потока (yt-dlp / SoundCloud), прежде чем откатываться на YouTube IFrame
       if (!url.startsWith('blob:')) {
         fallbackTimerRef.current = setTimeout(() => {
           if (modeRef.current === 'native' && el.paused) {
             startYoutubeFallback(url);
           }
-        }, 3500);
+        }, 12000);
       }
 
       el.src = url;
@@ -236,8 +260,13 @@ export function useAudioEngine(onEndedOrOptions?: any) {
   const playPrev = useCallback(() => {
     const el = audioRef.current;
     if (modeRef.current === 'native' && el && el.currentTime > 3) {
+      userSeekingRef.current = true;
       el.currentTime = 0;
+      maxReachedTimeRef.current = 0;
       setCurrentTime(0);
+      setTimeout(() => {
+        userSeekingRef.current = false;
+      }, 300);
       return;
     }
     const { queue: q, currentIndex: idx } = stateRef.current;
@@ -252,20 +281,54 @@ export function useAudioEngine(onEndedOrOptions?: any) {
     const el = audioRef.current;
     if (!el) return;
 
+    const triggerNextInBackground = () => {
+      if (trackTransitionLockRef.current) return;
+      trackTransitionLockRef.current = true;
+      maxReachedTimeRef.current = 0;
+      // Ставим на паузу (это сохраняет аудиосессию iOS открытой) и сразу запускаем следующий трек
+      el.pause();
+      playNext();
+    };
+
     const onPlay = () => {
       if (modeRef.current !== 'native') return;
+      configureIosAudioSession();
       clearFallbackTimer();
       setIsPlaying(true);
       setIsLoading(false);
     };
+
+    const onPlaying = () => {
+      if (modeRef.current !== 'native') return;
+      configureIosAudioSession();
+      setIsPlaying(true);
+      setIsLoading(false);
+      if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+        navigator.mediaSession.playbackState = 'playing';
+        try {
+          navigator.mediaSession.setActionHandler('seekbackward', null);
+          navigator.mediaSession.setActionHandler('seekforward', null);
+          navigator.mediaSession.setActionHandler('previoustrack', () => playPrev());
+          navigator.mediaSession.setActionHandler('nexttrack', () => playNext());
+        } catch {
+          // игнорируем
+        }
+      }
+    };
+
     const onPause = () => {
       if (modeRef.current !== 'native') return;
       setIsPlaying(false);
+      if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+        navigator.mediaSession.playbackState = 'paused';
+      }
     };
+
     const onWaiting = () => {
       if (modeRef.current !== 'native') return;
       setIsLoading(true);
     };
+
     const onCanPlay = () => {
       if (modeRef.current !== 'native') return;
       clearFallbackTimer();
@@ -274,19 +337,57 @@ export function useAudioEngine(onEndedOrOptions?: any) {
         setDuration(el.duration);
       }
     };
+
+    const onSeeking = () => {
+      if (modeRef.current !== 'native') return;
+      // Если трек доиграл до конца и из-за loop=true перепрыгнул в 0:00
+      if (
+        !userSeekingRef.current &&
+        maxReachedTimeRef.current > 10 &&
+        isFinite(el.duration) &&
+        el.duration > 15 &&
+        el.currentTime < 1.5 &&
+        el.duration - maxReachedTimeRef.current < 3
+      ) {
+        triggerNextInBackground();
+      }
+    };
+
     const onTimeUpdate = () => {
       if (modeRef.current !== 'native') return;
       clearFallbackTimer();
       setIsLoading(false);
-      setCurrentTime(el.currentTime || 0);
-      if (isFinite(el.duration) && el.duration > 0) {
-        setDuration(el.duration);
+
+      const cur = el.currentTime || 0;
+      const dur = isFinite(el.duration) && el.duration > 0 ? el.duration : 0;
+
+      // Запасной перехват петли в 0:00 для iOS Safari
+      if (
+        !userSeekingRef.current &&
+        maxReachedTimeRef.current > 10 &&
+        dur > 15 &&
+        cur < 1.5 &&
+        dur - maxReachedTimeRef.current < 3
+      ) {
+        triggerNextInBackground();
+        return;
+      }
+
+      if (cur > maxReachedTimeRef.current) {
+        maxReachedTimeRef.current = cur;
+      }
+
+      setCurrentTime(cur);
+      if (dur > 0) {
+        setDuration(dur);
       }
     };
+
     const onEnded = () => {
       if (modeRef.current !== 'native') return;
-      playNext();
+      triggerNextInBackground();
     };
+
     const onError = () => {
       if (modeRef.current !== 'native') return;
       clearFallbackTimer();
@@ -299,24 +400,36 @@ export function useAudioEngine(onEndedOrOptions?: any) {
       }
     };
 
+    const onVisibilityChange = () => {
+      if (document.hidden && audioCtxRef.current?.state === 'suspended') {
+        audioCtxRef.current.resume().catch(() => {});
+      }
+    };
+
     el.addEventListener('play', onPlay);
+    el.addEventListener('playing', onPlaying);
     el.addEventListener('pause', onPause);
     el.addEventListener('waiting', onWaiting);
     el.addEventListener('canplay', onCanPlay);
+    el.addEventListener('seeking', onSeeking);
     el.addEventListener('timeupdate', onTimeUpdate);
     el.addEventListener('ended', onEnded);
     el.addEventListener('error', onError);
+    document.addEventListener('visibilitychange', onVisibilityChange);
 
     return () => {
       el.removeEventListener('play', onPlay);
+      el.removeEventListener('playing', onPlaying);
       el.removeEventListener('pause', onPause);
       el.removeEventListener('waiting', onWaiting);
       el.removeEventListener('canplay', onCanPlay);
+      el.removeEventListener('seeking', onSeeking);
       el.removeEventListener('timeupdate', onTimeUpdate);
       el.removeEventListener('ended', onEnded);
       el.removeEventListener('error', onError);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, [playNext, startYoutubeFallback]);
+  }, [playNext, playPrev, startYoutubeFallback]);
 
   useEffect(() => {
     const init = () => {
@@ -408,6 +521,7 @@ export function useAudioEngine(onEndedOrOptions?: any) {
 
   const togglePlay = useCallback(() => {
     setIsLoading(false);
+    configureIosAudioSession();
 
     if (modeRef.current === 'native') {
       const el = audioRef.current;
@@ -463,8 +577,13 @@ export function useAudioEngine(onEndedOrOptions?: any) {
     if (modeRef.current === 'native') {
       const el = audioRef.current;
       if (!el) return;
+      userSeekingRef.current = true;
+      maxReachedTimeRef.current = sec;
       el.currentTime = sec;
       setCurrentTime(sec);
+      setTimeout(() => {
+        userSeekingRef.current = false;
+      }, 300);
       return;
     }
     if (!ytReadyRef.current || !ytPlayerRef.current) return;

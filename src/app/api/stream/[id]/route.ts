@@ -10,8 +10,7 @@ interface AudioSource {
   url: string;
   mimeType: string;
   userAgent: string;
-  provider: 'youtube' | 'soundcloud';
-  isHls?: boolean;
+  provider: 'soundcloud';
 }
 
 const streamUrlCache = new Map<string, AudioSource & { expiresAt: number }>();
@@ -44,57 +43,50 @@ async function getSoundCloudClientId(): Promise<string> {
     return cachedScClientId.id;
   }
 
-  const pageRes = await fetch('https://soundcloud.com', {
-    headers: { 'User-Agent': BROWSER_UA },
-    signal: AbortSignal.timeout(5000),
-  });
-  const html = await pageRes.text();
-  const scriptUrls = [
-    ...html.matchAll(/<script[^>]+src="(https:\/\/a-v2\.sndcdn\.com\/assets\/[^"]+\.js)"/g),
-  ]
-    .map((m) => m[1])
-    .reverse()
-    .slice(0, 12);
+  try {
+    const pageRes = await fetch('https://soundcloud.com', {
+      headers: { 'User-Agent': BROWSER_UA },
+      signal: AbortSignal.timeout(4000),
+    });
+    const html = await pageRes.text();
+    const scriptUrls = [
+      ...html.matchAll(/<script[^>]+src="(https:\/\/a-v2\.sndcdn\.com\/assets\/[^"]+\.js)"/g),
+    ]
+      .map((m) => m[1])
+      .reverse()
+      .slice(0, 10);
 
-  for (let i = 0; i < scriptUrls.length; i += 4) {
-    const batch = scriptUrls.slice(i, i + 4);
-    const results = await Promise.all(
-      batch.map(async (scriptUrl) => {
-        try {
-          const jsRes = await fetch(scriptUrl, { signal: AbortSignal.timeout(4000) });
-          if (!jsRes.ok) return null;
-          const js = await jsRes.text();
-          const match =
-            js.match(/client_id\s*[:=]\s*["']([a-zA-Z0-9]{32})["']/) ||
-            js.match(/client_id=([a-zA-Z0-9]{32})/);
-          return match?.[1] || null;
-        } catch {
-          return null;
+    for (const scriptUrl of scriptUrls) {
+      try {
+        const jsRes = await fetch(scriptUrl, { signal: AbortSignal.timeout(3000) });
+        if (!jsRes.ok) continue;
+        const js = await jsRes.text();
+        const match =
+          js.match(/client_id\s*[:=]\s*["']([a-zA-Z0-9]{32})["']/) ||
+          js.match(/client_id=([a-zA-Z0-9]{32})/);
+        if (match?.[1]) {
+          const id = match[1];
+          cachedScClientId = { id, expiresAt: Date.now() + 1000 * 60 * 60 * 12 };
+          return id;
         }
-      })
-    );
-    const found = results.find(Boolean);
-    if (found) {
-      cachedScClientId = {
-        id: found,
-        expiresAt: Date.now() + 1000 * 60 * 60 * 12,
-      };
-      return found;
+      } catch {}
     }
-  }
+  } catch {}
 
-  throw new Error('SoundCloud client_id not found');
+  // Запасной рабочий дефолтный client_id SoundCloud на крайний случай
+  return 'iZIs9schVcX5lhOfkWznGGPLICJaEMpy';
 }
 
 async function fetchFromSoundCloud(rawQuery: string): Promise<AudioSource> {
   const clientId = await getSoundCloudClientId();
   const cleanQuery = cleanTrackQuery(rawQuery) || rawQuery;
 
-  const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(cleanQuery)}&client_id=${clientId}&limit=10`;
+  const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(cleanQuery)}&client_id=${clientId}&limit=15`;
   const res = await fetch(searchUrl, {
-    signal: AbortSignal.timeout(6000),
+    signal: AbortSignal.timeout(5000),
     headers: { 'User-Agent': BROWSER_UA },
   });
+  
   if (!res.ok) {
     if (res.status === 401 || res.status === 403) cachedScClientId = null;
     throw new Error('SC search HTTP ' + res.status);
@@ -106,7 +98,7 @@ async function fetchFromSoundCloud(rawQuery: string): Promise<AudioSource> {
   for (const track of items) {
     if (!Array.isArray(track?.media?.transcodings)) continue;
     if (track.policy === 'BLOCK' || track.policy === 'SNIP') continue;
-    if ((track.duration || 0) < 40000) continue;
+    if ((track.duration || 0) < 30000) continue;
 
     const progressive = track.media.transcodings.find(
       (t: any) =>
@@ -119,7 +111,7 @@ async function fetchFromSoundCloud(rawQuery: string): Promise<AudioSource> {
     if (progressive) {
       try {
         const infoRes = await fetch(`${progressive.url}?client_id=${clientId}`, {
-          signal: AbortSignal.timeout(4000),
+          signal: AbortSignal.timeout(3500),
         });
         if (infoRes.ok) {
           const info = await infoRes.json();
@@ -129,7 +121,6 @@ async function fetchFromSoundCloud(rawQuery: string): Promise<AudioSource> {
               mimeType: 'audio/mpeg',
               userAgent: BROWSER_UA,
               provider: 'soundcloud',
-              isHls: false,
             };
           }
         }
@@ -152,6 +143,7 @@ async function handleStream(
       return NextResponse.json({ error: 'Missing track id' }, { status: 400 });
     }
 
+    const isPrefetch = req.nextUrl.searchParams.get('prefetch') === '1';
     const targetTitle = (req.nextUrl.searchParams.get('t') || '').trim();
     const targetArtist = (req.nextUrl.searchParams.get('a') || '').trim();
     const cacheKey = `${rawId}:${targetTitle}:${targetArtist}`;
@@ -170,14 +162,29 @@ async function handleStream(
         query = rawId;
       }
 
-      source = {
-        ...(await fetchFromSoundCloud(query)),
-        expiresAt: Date.now() + 1000 * 60 * 60,
-      };
-      streamUrlCache.set(cacheKey, source);
+      try {
+        const sc = await fetchFromSoundCloud(query);
+        source = { ...sc, expiresAt: Date.now() + 1000 * 60 * 60 };
+        streamUrlCache.set(cacheKey, source);
+      } catch (err) {
+        // Если точный поиск не дал результатов, пробуем запросить хотя бы по названию трека
+        if (targetTitle) {
+          try {
+            const sc = await fetchFromSoundCloud(targetTitle);
+            source = { ...sc, expiresAt: Date.now() + 1000 * 60 * 60 };
+            streamUrlCache.set(cacheKey, source);
+          } catch {
+            if (isPrefetch) return NextResponse.json({ ok: false });
+            return NextResponse.json({ error: 'Track not found' }, { status: 404 });
+          }
+        } else {
+          if (isPrefetch) return NextResponse.json({ ok: false });
+          return NextResponse.json({ error: 'Track not found' }, { status: 404 });
+        }
+      }
     }
 
-    if (req.nextUrl.searchParams.get('prefetch') === '1') {
+    if (isPrefetch) {
       return NextResponse.json({ ok: true });
     }
 
@@ -188,24 +195,28 @@ async function handleStream(
     let upstream = await fetch(source.url, {
       method: isHead ? 'HEAD' : 'GET',
       headers,
-    });
+    }).catch(() => null);
 
-    if (!upstream.ok && upstream.status !== 206) {
+    if (!upstream || (!upstream.ok && upstream.status !== 206)) {
       streamUrlCache.delete(cacheKey);
       let query = targetTitle ? `${targetArtist} ${targetTitle}` : rawId;
       if (rawId.startsWith('ytq:')) query = safeDecode(rawId.split(':').slice(2).join(':')).trim();
 
-      const freshSource = await fetchFromSoundCloud(query);
-      source = { ...freshSource, expiresAt: Date.now() + 1000 * 60 * 60 };
-      streamUrlCache.set(cacheKey, source);
+      try {
+        const freshSource = await fetchFromSoundCloud(query);
+        source = { ...freshSource, expiresAt: Date.now() + 1000 * 60 * 60 };
+        streamUrlCache.set(cacheKey, source);
 
-      upstream = await fetch(source.url, {
-        method: isHead ? 'HEAD' : 'GET',
-        headers,
-      });
+        upstream = await fetch(source.url, {
+          method: isHead ? 'HEAD' : 'GET',
+          headers,
+        });
+      } catch {
+        return NextResponse.json({ error: 'Upstream stream failed' }, { status: 502 });
+      }
     }
 
-    if (!upstream.ok && upstream.status !== 206) {
+    if (!upstream || (!upstream.ok && upstream.status !== 206)) {
       return NextResponse.json({ error: 'Upstream stream failed' }, { status: 502 });
     }
 

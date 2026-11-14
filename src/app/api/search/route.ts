@@ -140,16 +140,6 @@ async function ytSearch(query: string) {
   return { tracks, albums };
 }
 
-// Быстрый поиск одного трека для импорта из Spotify
-async function resolveSpotifyTrack(query: string) {
-  try {
-    const { tracks } = await ytSearch(`${query} audio`);
-    return tracks[0] || null;
-  } catch {
-    return null;
-  }
-}
-
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const q = searchParams.get('q')?.trim() || '';
@@ -198,50 +188,5 @@ export async function GET(req: NextRequest) {
   } catch (err) {
     console.error('[SEARCH] Ошибка:', err);
     return NextResponse.json({ tracks: [], albums: [], artists: [] }, { status: 500 });
-  }
-}
-
-// Обработка пакетного импорта Spotify через POST-запрос с параллельным поиском (батчи по 15 штук)
-export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json();
-    const rawTracks = body?.tracks || [];
-    if (!Array.isArray(rawTracks) || rawTracks.length === 0) {
-      return NextResponse.json({ title: body?.title || 'Spotify Плейлист', tracks: [] });
-    }
-
-    console.log(`[SPOTIFY IMPORT] Обработка ${rawTracks.length} треков...`);
-    const resolvedTracks = [];
-    const batchSize = 15;
-
-    for (let i = 0; i < rawTracks.length; i += batchSize) {
-      const chunk = rawTracks.slice(i, i + batchSize);
-      const promises = chunk.map(async (t: any) => {
-        const query = `${t.artist || ''} - ${t.title || ''}`.trim();
-        if (!query) return null;
-        const found = await resolveSpotifyTrack(query);
-        if (found) {
-          return {
-            ...found,
-            title: t.title || found.title,
-            artist: t.artist || found.artist,
-          };
-        }
-        return null;
-      });
-
-      const results = await Promise.all(promises);
-      for (const r of results) {
-        if (r) resolvedTracks.push(r);
-      }
-    }
-
-    return NextResponse.json({
-      title: body?.title || 'Spotify Плейлист',
-      tracks: resolvedTracks,
-    });
-  } catch (err) {
-    console.error('[SPOTIFY POST] Ошибка:', err);
-    return NextResponse.json({ title: 'Плейлист', tracks: [] }, { status: 500 });
   }
 }

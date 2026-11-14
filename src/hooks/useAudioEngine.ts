@@ -29,14 +29,17 @@ declare global {
   }
 }
 
+const resolvedYtqCache = new Map<string, string>();
+
 export function useAudioEngine(onEndedOrOptions?: any) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const ytPlayerRef = useRef<any>(null);
   const ytReadyRef = useRef(false);
   const pendingYtIdRef = useRef<string | null>(null);
   const modeRef = useRef<'native' | 'youtube'>('native');
+  const lastUrlRef = useRef<string>('');
+  const fallbackTimerRef = useRef<any>(null);
 
-  // Web Audio API для эквалайзера (подключается только при изменении полос EQ, чтобы не мешать фону iOS)
   const audioCtxRef = useRef<AudioContext | null>(null);
   const filtersRef = useRef<BiquadFilterNode[]>([]);
   const eqConnectedRef = useRef(false);
@@ -65,6 +68,13 @@ export function useAudioEngine(onEndedOrOptions?: any) {
   const stateRef = useRef({ queue, currentIndex });
   stateRef.current = { queue, currentIndex };
 
+  const clearFallbackTimer = () => {
+    if (fallbackTimerRef.current) {
+      clearTimeout(fallbackTimerRef.current);
+      fallbackTimerRef.current = null;
+    }
+  };
+
   const ensureEqGraph = useCallback(() => {
     const el = audioRef.current;
     if (!el || eqConnectedRef.current || typeof window === 'undefined') return;
@@ -92,7 +102,7 @@ export function useAudioEngine(onEndedOrOptions?: any) {
       filtersRef.current = filters;
       eqConnectedRef.current = true;
     } catch {
-      // Игнорируем, если браузер запретил AudioContext
+      // Игнорируем
     }
   }, []);
 
@@ -104,11 +114,50 @@ export function useAudioEngine(onEndedOrOptions?: any) {
     }
   }, []);
 
-  const startYoutubeFallback = useCallback((rawId: string) => {
+  const startYoutubeFallback = useCallback(async (rawUrl: string) => {
+    clearFallbackTimer();
     modeRef.current = 'youtube';
-    const cleanId = rawId.replace('/api/stream/', '').split('?')[0];
+
+    // Останавливаем нативный тег, чтобы не было двойного звука
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.removeAttribute('src');
+    }
+
+    let cleanId = decodeURIComponent(rawUrl.replace('/api/stream/', '').split('?')[0]);
+
+    if (cleanId.startsWith('ytq:')) {
+      const cached = resolvedYtqCache.get(cleanId);
+      if (cached) {
+        cleanId = cached;
+      } else {
+        try {
+          const encodedQuery = cleanId.split(':').slice(2).join(':');
+          const res = await fetch(`/api/search?q=${encodedQuery}`);
+          const data = await res.json();
+          const bestId = data?.tracks?.[0]?.id;
+          if (!bestId) {
+            setIsLoading(false);
+            setIsPlaying(false);
+            setError('Трек не найден');
+            return;
+          }
+          resolvedYtqCache.set(cleanId, bestId);
+          cleanId = bestId;
+        } catch {
+          setIsLoading(false);
+          setIsPlaying(false);
+          setError('Ошибка поиска трека');
+          return;
+        }
+      }
+    }
+
     if (ytReadyRef.current && ytPlayerRef.current?.loadVideoById) {
       ytPlayerRef.current.loadVideoById({ videoId: cleanId, startSeconds: 0 });
+      setTimeout(() => {
+        ytPlayerRef.current?.playVideo?.();
+      }, 200);
     } else {
       pendingYtIdRef.current = cleanId;
     }
@@ -124,6 +173,8 @@ export function useAudioEngine(onEndedOrOptions?: any) {
             ? input.id
             : `/api/stream/${encodeURIComponent(input.id)}`;
 
+      lastUrlRef.current = url;
+      clearFallbackTimer();
       setError(null);
       setIsLoading(true);
       setCurrentTime(0);
@@ -137,15 +188,25 @@ export function useAudioEngine(onEndedOrOptions?: any) {
         audioCtxRef.current.resume().catch(() => {});
       }
 
+      // Если нативный поток не заиграл за 3.5 секунды — сразу включаем резервный плеер
+      if (!url.startsWith('blob:')) {
+        fallbackTimerRef.current = setTimeout(() => {
+          if (modeRef.current === 'native' && el.paused) {
+            startYoutubeFallback(url);
+          }
+        }, 3500);
+      }
+
       el.src = url;
       el.load();
 
       try {
         await el.play();
+        clearFallbackTimer();
         setIsPlaying(true);
         setIsLoading(false);
       } catch {
-        // Если прямой поток не запустился, откатываемся на YouTube IFrame
+        clearFallbackTimer();
         if (!url.startsWith('blob:')) {
           startYoutubeFallback(url);
         } else {
@@ -187,13 +248,13 @@ export function useAudioEngine(onEndedOrOptions?: any) {
     }
   }, [playStream]);
 
-  // Слушатели нативного <audio> (работают даже с выключенным экраном iPhone/Android)
   useEffect(() => {
     const el = audioRef.current;
     if (!el) return;
 
     const onPlay = () => {
       if (modeRef.current !== 'native') return;
+      clearFallbackTimer();
       setIsPlaying(true);
       setIsLoading(false);
     };
@@ -207,6 +268,7 @@ export function useAudioEngine(onEndedOrOptions?: any) {
     };
     const onCanPlay = () => {
       if (modeRef.current !== 'native') return;
+      clearFallbackTimer();
       setIsLoading(false);
       if (isFinite(el.duration) && el.duration > 0) {
         setDuration(el.duration);
@@ -214,6 +276,8 @@ export function useAudioEngine(onEndedOrOptions?: any) {
     };
     const onTimeUpdate = () => {
       if (modeRef.current !== 'native') return;
+      clearFallbackTimer();
+      setIsLoading(false);
       setCurrentTime(el.currentTime || 0);
       if (isFinite(el.duration) && el.duration > 0) {
         setDuration(el.duration);
@@ -225,6 +289,7 @@ export function useAudioEngine(onEndedOrOptions?: any) {
     };
     const onError = () => {
       if (modeRef.current !== 'native') return;
+      clearFallbackTimer();
       const src = el.getAttribute('src') || '';
       if (src && !src.startsWith('blob:')) {
         startYoutubeFallback(src);
@@ -253,7 +318,6 @@ export function useAudioEngine(onEndedOrOptions?: any) {
     };
   }, [playNext, startYoutubeFallback]);
 
-  // Резервный YouTube IFrame API (на случай блокировки потока)
   useEffect(() => {
     const init = () => {
       if (ytPlayerRef.current || !document.getElementById('yt-global-player')) return;
@@ -285,12 +349,14 @@ export function useAudioEngine(onEndedOrOptions?: any) {
               setIsLoading(true);
             } else if (e.data === 0) {
               setIsPlaying(false);
+              setIsLoading(false);
               playNext();
             }
           },
           onError: () => {
             if (modeRef.current !== 'youtube') return;
             setIsLoading(false);
+            setIsPlaying(false);
             setError('Трек недоступен');
           },
         },
@@ -315,13 +381,17 @@ export function useAudioEngine(onEndedOrOptions?: any) {
 
     const timer = setInterval(() => {
       if (modeRef.current === 'youtube' && ytReadyRef.current && ytPlayerRef.current?.getPlayerState?.() === 1) {
+        setIsLoading(false);
         setCurrentTime(ytPlayerRef.current.getCurrentTime?.() || 0);
         const d = ytPlayerRef.current.getDuration?.() || 0;
         if (d > 0) setDuration(d);
       }
     }, 250);
 
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      clearFallbackTimer();
+    };
   }, [playNext, volume]);
 
   const playTrack = useCallback(
@@ -337,26 +407,51 @@ export function useAudioEngine(onEndedOrOptions?: any) {
   );
 
   const togglePlay = useCallback(() => {
+    setIsLoading(false);
+
     if (modeRef.current === 'native') {
       const el = audioRef.current;
       if (!el) return;
+
+      if (el.error || !el.getAttribute('src')) {
+        if (lastUrlRef.current) {
+          playStream(lastUrlRef.current);
+        }
+        return;
+      }
+
       if (el.paused) {
         if (audioCtxRef.current?.state === 'suspended') {
           audioCtxRef.current.resume().catch(() => {});
         }
-        el.play().catch(() => {});
+        el.play()
+          .then(() => setIsPlaying(true))
+          .catch(() => {
+            if (lastUrlRef.current && !lastUrlRef.current.startsWith('blob:')) {
+              startYoutubeFallback(lastUrlRef.current);
+            }
+          });
       } else {
         el.pause();
+        setIsPlaying(false);
       }
       return;
     }
 
     if (!ytReadyRef.current || !ytPlayerRef.current) return;
-    if (isPlaying) ytPlayerRef.current.pauseVideo();
-    else ytPlayerRef.current.playVideo();
-  }, [isPlaying]);
+    const state = ytPlayerRef.current.getPlayerState?.();
+    if (state === 1) {
+      ytPlayerRef.current.pauseVideo();
+      setIsPlaying(false);
+    } else {
+      ytPlayerRef.current.playVideo();
+      setIsPlaying(true);
+    }
+  }, [playStream, startYoutubeFallback]);
 
   const pause = useCallback(() => {
+    setIsLoading(false);
+    setIsPlaying(false);
     if (modeRef.current === 'native') {
       audioRef.current?.pause();
     } else {
@@ -464,8 +559,7 @@ export function useAudioEngine(onEndedOrOptions?: any) {
     playTrack,
     play: (arg?: any) => {
       if (arg) return playStream(arg);
-      if (modeRef.current === 'native') audioRef.current?.play().catch(() => {});
-      else ytPlayerRef.current?.playVideo?.();
+      togglePlay();
     },
     pause,
     togglePlay,

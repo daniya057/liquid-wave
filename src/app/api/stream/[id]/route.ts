@@ -12,6 +12,12 @@ const PIPED_INSTANCES = [
   'https://pipedapi.drgns.space',
 ];
 
+const INVIDIOUS_INSTANCES = [
+  'https://inv.nadeko.net',
+  'https://invidious.nerdvpn.de',
+  'https://yt.artemislena.eu',
+];
+
 async function resolveYtqId(rawId: string): Promise<string> {
   if (!rawId.startsWith('ytq:')) return rawId;
   const query = decodeURIComponent(rawId.split(':').slice(2).join(':'));
@@ -30,131 +36,110 @@ async function resolveYtqId(rawId: string): Promise<string> {
   return match[1];
 }
 
-async function fetchFromInnerTube(videoId: string): Promise<{ url: string; mimeType: string } | null> {
-  const clients = [
-    {
-      name: 'ANDROID_VR',
-      context: {
-        client: {
-          clientName: 'ANDROID_VR',
-          clientVersion: '1.60.19',
-          deviceMake: 'Oculus',
-          deviceModel: 'Quest 3',
-          osName: 'Android',
-          osVersion: '12L',
-          androidSdkVersion: 32,
-          hl: 'en',
-          gl: 'US',
-        },
+async function fetchInnerTubeOne(
+  videoId: string,
+  clientName: string,
+  clientVersion: string,
+  ua: string,
+  extraClient: Record<string, any> = {}
+): Promise<{ url: string; mimeType: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3500);
+  try {
+    const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': ua,
       },
-      ua: 'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
-    },
-    {
-      name: 'IOS',
-      context: {
-        client: {
-          clientName: 'IOS',
-          clientVersion: '19.45.4',
-          deviceMake: 'Apple',
-          deviceModel: 'iPhone16,2',
-          osName: 'iPhone',
-          osVersion: '18.1.0.22B83',
-          hl: 'en',
-          gl: 'US',
+      body: JSON.stringify({
+        videoId,
+        context: {
+          client: {
+            clientName,
+            clientVersion,
+            hl: 'en',
+            gl: 'US',
+            ...extraClient,
+          },
         },
-      },
-      ua: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
-    },
-    {
-      name: 'ANDROID',
-      context: {
-        client: {
-          clientName: 'ANDROID',
-          clientVersion: '19.44.38',
-          androidSdkVersion: 34,
-          hl: 'en',
-          gl: 'US',
-        },
-      },
-      ua: 'com.google.android.youtube/19.44.38 (Linux; U; Android 14; en_US) gzip',
-    },
-  ];
+        contentCheckOk: true,
+        racyCheckOk: true,
+      }),
+    });
+    if (!res.ok) throw new Error('InnerTube HTTP ' + res.status);
+    const data = await res.json();
+    const formats = [
+      ...(data?.streamingData?.adaptiveFormats || []),
+      ...(data?.streamingData?.formats || []),
+    ];
 
-  for (const client of clients) {
-    try {
-      const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'User-Agent': client.ua,
-        },
-        body: JSON.stringify({
-          videoId,
-          context: client.context,
-          contentCheckOk: true,
-          racyCheckOk: true,
-        }),
-      });
-
-      if (!res.ok) continue;
-      const data = await res.json();
-      const formats = [
-        ...(data?.streamingData?.adaptiveFormats || []),
-        ...(data?.streamingData?.formats || []),
-      ];
-
-      const audioFormats = formats
-        .filter((f: any) => f.url && typeof f.mimeType === 'string' && f.mimeType.startsWith('audio/'))
-        .sort((a: any, b: any) => {
-          // Предпочитаем m4a (audio/mp4) для идеальной совместимости с iPhone Safari
-          const aMp4 = a.mimeType.includes('mp4') ? 1 : 0;
-          const bMp4 = b.mimeType.includes('mp4') ? 1 : 0;
-          if (aMp4 !== bMp4) return bMp4 - aMp4;
-          return (b.bitrate || 0) - (a.bitrate || 0);
-        });
-
-      if (audioFormats[0]?.url) {
-        return {
-          url: audioFormats[0].url,
-          mimeType: audioFormats[0].mimeType.split(';')[0] || 'audio/mp4',
-        };
-      }
-    } catch {
-      // пробуем следующий клиент
-    }
-  }
-
-  return null;
-}
-
-async function fetchFromPiped(videoId: string): Promise<{ url: string; mimeType: string } | null> {
-  for (const base of PIPED_INSTANCES) {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 4500);
-      const res = await fetch(`${base}/streams/${videoId}`, { signal: controller.signal });
-      clearTimeout(timeout);
-      if (!res.ok) continue;
-
-      const data = await res.json();
-      const streams = (data?.audioStreams || []).sort((a: any, b: any) => {
-        const aM4a = (a.mimeType || '').includes('mp4') ? 1 : 0;
-        const bM4a = (b.mimeType || '').includes('mp4') ? 1 : 0;
-        if (aM4a !== bM4a) return bM4a - aM4a;
+    const audioFormats = formats
+      .filter((f: any) => f.url && typeof f.mimeType === 'string' && f.mimeType.startsWith('audio/'))
+      .sort((a: any, b: any) => {
+        const aMp4 = a.mimeType.includes('mp4') ? 1 : 0;
+        const bMp4 = b.mimeType.includes('mp4') ? 1 : 0;
+        if (aMp4 !== bMp4) return bMp4 - aMp4;
         return (b.bitrate || 0) - (a.bitrate || 0);
       });
 
-      if (streams[0]?.url) {
-        return {
-          url: streams[0].url,
-          mimeType: streams[0].mimeType?.split(';')[0] || 'audio/mp4',
-        };
-      }
-    } catch {
-      // пробуем следующий сервер
-    }
+    if (!audioFormats[0]?.url) throw new Error('No audio format');
+    return {
+      url: audioFormats[0].url,
+      mimeType: audioFormats[0].mimeType.split(';')[0] || 'audio/mp4',
+    };
+  } finally {
+    clearTimeout(timer);
   }
-  return null;
+}
+
+async function fetchPipedOne(base: string, videoId: string): Promise<{ url: string; mimeType: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3500);
+  try {
+    const res = await fetch(`${base}/streams/${videoId}`, { signal: controller.signal });
+    if (!res.ok) throw new Error('Piped HTTP ' + res.status);
+    const data = await res.json();
+    const streams = (data?.audioStreams || []).sort((a: any, b: any) => {
+      const aM4a = (a.mimeType || '').includes('mp4') ? 1 : 0;
+      const bM4a = (b.mimeType || '').includes('mp4') ? 1 : 0;
+      if (aM4a !== bM4a) return bM4a - aM4a;
+      return (b.bitrate || 0) - (a.bitrate || 0);
+    });
+    if (!streams[0]?.url) throw new Error('No Piped stream');
+    return {
+      url: streams[0].url,
+      mimeType: streams[0].mimeType?.split(';')[0] || 'audio/mp4',
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchInvidiousOne(base: string, videoId: string): Promise<{ url: string; mimeType: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3500);
+  try {
+    const res = await fetch(`${base}/api/v1/videos/${videoId}`, { signal: controller.signal });
+    if (!res.ok) throw new Error('Invidious HTTP ' + res.status);
+    const data = await res.json();
+    const formats = (data?.adaptiveFormats || [])
+      .filter((f: any) => f.url && typeof f.type === 'string' && f.type.startsWith('audio/'))
+      .sort((a: any, b: any) => {
+        const aM4a = a.type.includes('mp4') ? 1 : 0;
+        const bM4a = b.type.includes('mp4') ? 1 : 0;
+        if (aM4a !== bM4a) return bM4a - aM4a;
+        return Number(b.bitrate || 0) - Number(a.bitrate || 0);
+      });
+    if (!formats[0]?.url) throw new Error('No Invidious stream');
+    return {
+      url: formats[0].url,
+      mimeType: formats[0].type.split(';')[0] || 'audio/mp4',
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function getAudioSource(videoId: string): Promise<{ url: string; mimeType: string }> {
@@ -163,15 +148,29 @@ async function getAudioSource(videoId: string): Promise<{ url: string; mimeType:
     return { url: cached.url, mimeType: cached.mimeType };
   }
 
-  const resolved = (await fetchFromInnerTube(videoId)) || (await fetchFromPiped(videoId));
-  if (!resolved) {
-    throw new Error('No audio stream available');
-  }
+  const resolved = await Promise.any([
+    fetchInnerTubeOne(
+      videoId,
+      'ANDROID_VR',
+      '1.60.19',
+      'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+      { deviceMake: 'Oculus', deviceModel: 'Quest 3', osName: 'Android', osVersion: '12L', androidSdkVersion: 32 }
+    ),
+    fetchInnerTubeOne(
+      videoId,
+      'IOS',
+      '19.45.4',
+      'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
+      { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' }
+    ),
+    ...PIPED_INSTANCES.map((base) => fetchPipedOne(base, videoId)),
+    ...INVIDIOUS_INSTANCES.map((base) => fetchInvidiousOne(base, videoId)),
+  ]);
 
   streamUrlCache.set(videoId, {
     url: resolved.url,
     mimeType: resolved.mimeType,
-    expiresAt: Date.now() + 1000 * 60 * 90, // 1.5 часа
+    expiresAt: Date.now() + 1000 * 60 * 90,
   });
 
   return resolved;
@@ -179,11 +178,11 @@ async function getAudioSource(videoId: string): Promise<{ url: string; mimeType:
 
 export async function GET(
   req: NextRequest,
-  context: { params: Promise<{ id: string }> | { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const resolvedParams = await Promise.resolve(context.params);
-    const rawId = decodeURIComponent(resolvedParams.id || '');
+    const { id } = await params;
+    const rawId = decodeURIComponent(id || '');
     if (!rawId) {
       return NextResponse.json({ error: 'Missing track id' }, { status: 400 });
     }
@@ -191,7 +190,6 @@ export async function GET(
     const videoId = await resolveYtqId(rawId);
     const source = await getAudioSource(videoId);
 
-    // Если это просто предзагрузка (prefetch=1), прогрели кэш и выходим
     if (req.nextUrl.searchParams.get('prefetch') === '1') {
       return NextResponse.json({ ok: true, id: videoId });
     }
@@ -207,7 +205,6 @@ export async function GET(
 
     let upstream = await fetch(source.url, { headers: upstreamHeaders });
 
-    // Если кэшированная ссылка протухла, обновляем один раз
     if (upstream.status === 403 || upstream.status === 410) {
       streamUrlCache.delete(videoId);
       const fresh = await getAudioSource(videoId);

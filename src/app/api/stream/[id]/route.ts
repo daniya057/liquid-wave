@@ -12,12 +12,117 @@ interface AudioSource {
 const streamUrlCache = new Map<string, AudioSource & { expiresAt: number }>();
 let cachedScClientId: { id: string; expiresAt: number } | null = null;
 
+const UNWANTED_MODIFIERS = [
+  'remix',
+  'rmx',
+  'flip',
+  'bootleg',
+  'mashup',
+  'rework',
+  'live',
+  'concert',
+  'tour',
+  'festival',
+  'session',
+  'acoustic',
+  'unplugged',
+  'slowed',
+  'reverb',
+  'sped up',
+  'speed up',
+  'nightcore',
+  '8d',
+  'bass boosted',
+  'bassboost',
+  'cover',
+  'karaoke',
+  'instrumental',
+  'tribute',
+  'parody',
+  'snippet',
+  'teaser',
+  'ремикс',
+  'концерт',
+  'лайв',
+  'акустик',
+  'замедл',
+  'ускор',
+  'кавер',
+  'минус',
+  'инструментал',
+  'пародия',
+];
+
 function safeDecode(value: string): string {
   try {
     return decodeURIComponent(value);
   } catch {
     return value;
   }
+}
+
+function cleanTrackQuery(raw: string): string {
+  return raw
+    .replace(
+      /\((?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|клип|премьера|текст|аудио|видео)[^)]*\)/gi,
+      ''
+    )
+    .replace(
+      /\[(?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|клип|премьера|текст|аудио|видео)[^\]]*\]/gi,
+      ''
+    )
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+function scoreSoundCloudCandidate(item: any, cleanQuery: string): number {
+  const queryLower = cleanQuery.toLowerCase();
+  const titleLower = String(item?.title || '').toLowerCase();
+  const userLower = String(item?.user?.username || '').toLowerCase();
+  const tagsLower = String(item?.tag_list || '').toLowerCase();
+  const combined = `${titleLower} ${tagsLower}`;
+
+  let score = 0;
+
+  // Официальные/верифицированные каналы получают бонус
+  if (item?.user?.verified) score += 35;
+
+  // Штрафуем ремиксы, концерты, лайвы, slowed и каверы, если их не было в самом запросе
+  for (const mod of UNWANTED_MODIFIERS) {
+    if (!queryLower.includes(mod)) {
+      if (titleLower.includes(mod)) {
+        score -= 120;
+      } else if (tagsLower.includes(mod) || userLower.includes(mod)) {
+        score -= 45;
+      }
+    }
+  }
+
+  // Штраф за слишком длинные записи (концертные сеты / сборники > 8 минут)
+  const durationSec = (item?.duration || 0) / 1000;
+  if (durationSec > 480) {
+    score -= 80;
+  } else if (durationSec >= 110 && durationSec <= 360) {
+    score += 15;
+  }
+
+  // Бонус за совпадение ключевых слов из запроса в названии
+  const queryTokens = queryLower
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length > 2);
+
+  let matchedTokens = 0;
+  for (const token of queryTokens) {
+    if (combined.includes(token) || userLower.includes(token)) {
+      matchedTokens += 1;
+    }
+  }
+  if (queryTokens.length > 0) {
+    score += Math.round((matchedTokens / queryTokens.length) * 50);
+  }
+
+  return score;
 }
 
 async function getSoundCloudClientId(): Promise<string> {
@@ -65,13 +170,14 @@ function isFullTranscoding(t: any): boolean {
   return true;
 }
 
-async function fetchFromSoundCloudQuery(query: string): Promise<AudioSource> {
+async function fetchFromSoundCloudQuery(rawQuery: string): Promise<AudioSource> {
   const clientId = await getSoundCloudClientId();
+  const cleanQuery = cleanTrackQuery(rawQuery) || rawQuery;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5500);
+  const timer = setTimeout(() => controller.abort(), 6000);
 
   try {
-    const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=10`;
+    const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(cleanQuery)}&client_id=${clientId}&limit=15`;
     const res = await fetch(searchUrl, {
       signal: controller.signal,
       headers: {
@@ -84,16 +190,20 @@ async function fetchFromSoundCloudQuery(query: string): Promise<AudioSource> {
     const data = await res.json();
     const items: any[] = Array.isArray(data?.collection) ? data.collection : [];
 
-    // Берём только полноценные треки длиннее 45 секунд
-    const fullTracks = items.filter(
-      (item) =>
-        Array.isArray(item?.media?.transcodings) &&
-        (item.duration || 0) >= 45000 &&
-        item.policy !== 'BLOCK'
-    );
+    // Фильтруем полные треки и сортируем от самых чистых оригиналов к остальным
+    const rankedTracks = items
+      .filter(
+        (item) =>
+          Array.isArray(item?.media?.transcodings) &&
+          (item.duration || 0) >= 45000 &&
+          item.policy !== 'BLOCK'
+      )
+      .map((item) => ({ item, score: scoreSoundCloudCandidate(item, cleanQuery) }))
+      .sort((a, b) => b.score - a.score)
+      .map((entry) => entry.item);
 
-    // 1. Сначала ищем прямой полный progressive MP3 (без /preview/)
-    for (const track of fullTracks) {
+    // 1. Ищем полный progressive MP3 среди лучших кандидатов
+    for (const track of rankedTracks) {
       const progressive = track.media.transcodings.find(
         (t: any) => isFullTranscoding(t) && t?.format?.protocol === 'progressive'
       );
@@ -114,8 +224,8 @@ async function fetchFromSoundCloudQuery(query: string): Promise<AudioSource> {
       }
     }
 
-    // 2. Если прямого MP3 нет — берём полный HLS-поток (на iPhone играет нативно без лимита 30 сек)
-    for (const track of fullTracks) {
+    // 2. Если прямого MP3 нет — берём полный HLS-поток лучшего кандидата
+    for (const track of rankedTracks) {
       const hls = track.media.transcodings.find(
         (t: any) => isFullTranscoding(t) && t?.format?.protocol === 'hls'
       );
@@ -152,11 +262,11 @@ async function fetchYoutubeTitleOEmbed(videoId: string): Promise<string> {
     );
     if (!res.ok) throw new Error('oEmbed failed');
     const data = await res.json();
-    const title = String(data?.title || '').trim();
+    const title = cleanTrackQuery(String(data?.title || ''));
     const author = String(data?.author_name || '').replace(/\s*-\s*Topic$/i, '').trim();
     if (!title) throw new Error('Empty title');
     return author && !title.toLowerCase().includes(author.toLowerCase())
-      ? `${author} ${title}`
+      ? `${author} - ${title}`
       : title;
   } finally {
     clearTimeout(timer);
@@ -173,7 +283,8 @@ async function fetchInnerTubeMp4(
   clientName: string,
   clientVersion: string,
   ua: string,
-  extraClient: Record<string, any> = {}
+  extraClient: Record<string, any> = {},
+  extraContext: Record<string, any> = {}
 ): Promise<AudioSource> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 4000);
@@ -195,6 +306,7 @@ async function fetchInnerTubeMp4(
             gl: 'US',
             ...extraClient,
           },
+          ...extraContext,
         },
         contentCheckOk: true,
         racyCheckOk: true,
@@ -227,6 +339,33 @@ async function fetchInnerTubeMp4(
   }
 }
 
+async function fetchExactYoutubeMp4(videoId: string): Promise<AudioSource> {
+  return Promise.any([
+    fetchInnerTubeMp4(
+      videoId,
+      'IOS',
+      '19.45.4',
+      'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
+      { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' }
+    ),
+    fetchInnerTubeMp4(
+      videoId,
+      'ANDROID_VR',
+      '1.60.19',
+      'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+      { deviceMake: 'Oculus', deviceModel: 'Quest 3', osName: 'Android', osVersion: '12L', androidSdkVersion: 32 }
+    ),
+    fetchInnerTubeMp4(
+      videoId,
+      'WEB_EMBEDDED_PLAYER',
+      '1.20241126.01.00',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      {},
+      { thirdParty: { embedUrl: 'https://www.youtube.com/' } }
+    ),
+  ]);
+}
+
 async function getAudioSource(rawId: string): Promise<AudioSource> {
   const cached = streamUrlCache.get(rawId);
   if (cached && cached.expiresAt > Date.now()) {
@@ -240,23 +379,20 @@ async function getAudioSource(rawId: string): Promise<AudioSource> {
     if (!query) throw new Error('Empty track query');
     resolved = await fetchFromSoundCloudQuery(query);
   } else {
-    resolved = await Promise.any([
-      fetchFromSoundCloudByVideoId(rawId),
-      fetchInnerTubeMp4(
-        rawId,
-        'IOS',
-        '19.45.4',
-        'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
-        { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' }
-      ),
-      fetchInnerTubeMp4(
-        rawId,
-        'ANDROID_VR',
-        '1.60.19',
-        'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
-        { deviceMake: 'Oculus', deviceModel: 'Quest 3', osName: 'Android', osVersion: '12L', androidSdkVersion: 32 }
-      ),
+    // Запускаем оба источника параллельно, но даём точному YouTube-оригиналу фору 1.8 сек
+    const ytPromise = fetchExactYoutubeMp4(rawId);
+    const scPromise = fetchFromSoundCloudByVideoId(rawId);
+
+    const ytHeadStart = await Promise.race([
+      ytPromise.catch(() => null),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 1800)),
     ]);
+
+    if (ytHeadStart) {
+      resolved = ytHeadStart;
+    } else {
+      resolved = await Promise.any([ytPromise, scPromise]);
+    }
   }
 
   streamUrlCache.set(rawId, {
@@ -279,7 +415,6 @@ async function handleHlsStream(req: NextRequest, m3u8Url: string, isHead: boolea
   const ua = req.headers.get('user-agent') || '';
   const isAppleSafari = /iPhone|iPad|iPod|Macintosh/i.test(ua) && !/Chrome|CriOS|Edg/i.test(ua);
 
-  // iPhone / Safari декодирует .m3u8 нативно в <audio> с перемоткой и фоном
   if (isAppleSafari) {
     return new NextResponse(isHead ? null : m3u8Text, {
       status: 200,
@@ -290,7 +425,6 @@ async function handleHlsStream(req: NextRequest, m3u8Url: string, isHead: boolea
     });
   }
 
-  // Для Chrome / Windows склеиваем сегменты в непрерывный MP3-поток
   const segmentUrls = m3u8Text
     .split(/\r?\n/)
     .map((line) => line.trim())

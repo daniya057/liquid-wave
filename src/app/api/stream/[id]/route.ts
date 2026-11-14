@@ -6,14 +6,14 @@ export const dynamic = 'force-dynamic';
 const BROWSER_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
+const SC_CLIENT_ID = 'iZIs9schVcX5lhOfkWznGGPLICJaEMpy';
+
 interface AudioSource {
   url: string;
   mimeType: string;
-  userAgent: string;
 }
 
-const streamUrlCache = new Map<string, AudioSource & { expiresAt: number }>();
-let cachedScClientId: { id: string; expiresAt: number } | null = null;
+const cache = new Map<string, { source: AudioSource; exp: number }>();
 
 function safeDecode(value: string): string {
   try {
@@ -23,26 +23,23 @@ function safeDecode(value: string): string {
   }
 }
 
-async function getSoundCloudClientId(): Promise<string> {
-  if (cachedScClientId && cachedScClientId.expiresAt > Date.now()) {
-    return cachedScClientId.id;
-  }
-  const id = 'iZIs9schVcX5lhOfkWznGGPLICJaEMpy';
-  cachedScClientId = { id, expiresAt: Date.now() + 1000 * 60 * 60 * 12 };
-  return id;
-}
-
-async function searchAndGetTrackUrl(query: string, clientId: string): Promise<string | null> {
+async function getSoundCloudStreamUrl(query: string): Promise<string | null> {
   try {
-    const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=8`;
+    let cleanQuery = query;
+    if (cleanQuery.startsWith('ytq:')) {
+      cleanQuery = safeDecode(cleanQuery.split(':').slice(2).join(':'));
+    }
+    cleanQuery = cleanQuery.replace(/\([^)]*\)/g, '').replace(/\[[^\]]*\]/g, '').trim();
+
+    const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(cleanQuery)}&client_id=${SC_CLIENT_ID}&limit=10`;
     const res = await fetch(searchUrl, {
-      signal: AbortSignal.timeout(3000),
       headers: { 'User-Agent': BROWSER_UA },
+      signal: AbortSignal.timeout(4000),
     });
-    
+
     if (!res.ok) return null;
     const data = await res.json();
-    const items: any[] = Array.isArray(data?.collection) ? data.collection : [];
+    const items = Array.isArray(data?.collection) ? data.collection : [];
 
     for (const track of items) {
       if (!Array.isArray(track?.media?.transcodings)) continue;
@@ -57,9 +54,11 @@ async function searchAndGetTrackUrl(query: string, clientId: string): Promise<st
       );
 
       if (progressive) {
-        const infoRes = await fetch(`${progressive.url}?client_id=${clientId}`, {
-          signal: AbortSignal.timeout(2000),
+        const infoRes = await fetch(`${progressive.url}?client_id=${SC_CLIENT_ID}`, {
+          headers: { 'User-Agent': BROWSER_UA },
+          signal: AbortSignal.timeout(3000),
         }).catch(() => null);
+
         if (infoRes && infoRes.ok) {
           const info = await infoRes.json();
           if (info?.url && !info.url.includes('/preview/')) {
@@ -68,52 +67,19 @@ async function searchAndGetTrackUrl(query: string, clientId: string): Promise<st
         }
       }
     }
-  } catch {}
+  } catch (e) {
+    console.error('SC Stream Error:', e);
+  }
   return null;
 }
 
-async function fetchFromSoundCloud(rawId: string, targetTitle: string, targetArtist: string): Promise<AudioSource> {
-  const clientId = await getSoundCloudClientId();
-
-  // Очищаем любые ytq: префиксы и формируем чистый поисковый запрос
-  let cleanId = rawId;
-  if (cleanId.startsWith('ytq:')) {
-    cleanId = safeDecode(cleanId.split(':').slice(2).join(':')).trim();
-  }
-
-  // Приоритет: Артист + Название
-  let query = targetTitle ? `${targetArtist} ${targetTitle}`.trim() : cleanId;
-  let url = await searchAndGetTrackUrl(query, clientId);
-
-  // Если не нашлось — ищем просто по названию
-  if (!url && targetTitle) {
-    url = await searchAndGetTrackUrl(targetTitle, clientId);
-  }
-
-  // Последняя попытка по очищенному ID
-  if (!url && cleanId !== query) {
-    url = await searchAndGetTrackUrl(cleanId, clientId);
-  }
-
-  if (!url) {
-    throw new Error('No playable stream on SoundCloud');
-  }
-
-  return {
-    url,
-    mimeType: 'audio/mpeg',
-    userAgent: BROWSER_UA,
-  };
-}
-
-async function handleStream(
+export async function GET(
   req: NextRequest,
-  context: { params: Promise<{ id: string }> },
-  isHead: boolean
+  context: { params: Promise<{ id: string }> }
 ) {
   try {
-    const params = await context.params;
-    const rawId = safeDecode(params?.id || '').trim();
+    const { id } = await context.params;
+    const rawId = safeDecode(id || '').trim();
     if (!rawId) {
       return NextResponse.json({ error: 'Missing track id' }, { status: 400 });
     }
@@ -122,65 +88,49 @@ async function handleStream(
       return NextResponse.json({ ok: true });
     }
 
-    const targetTitle = safeDecode((req.nextUrl.searchParams.get('t') || '').trim());
-    const targetArtist = safeDecode((req.nextUrl.searchParams.get('a') || '').trim());
-    const cacheKey = `${rawId}:${targetTitle}:${targetArtist}`;
+    const targetTitle = safeDecode(req.nextUrl.searchParams.get('t') || '');
+    const targetArtist = safeDecode(req.nextUrl.searchParams.get('a') || '');
 
-    let source = streamUrlCache.get(cacheKey);
-    if (!source || source.expiresAt <= Date.now()) {
-      try {
-        const sc = await fetchFromSoundCloud(rawId, targetTitle, targetArtist);
-        source = { ...sc, expiresAt: Date.now() + 1000 * 60 * 30 };
-        streamUrlCache.set(cacheKey, source);
-      } catch {
-        return NextResponse.json({ error: 'Track not found' }, { status: 404 });
+    const cacheKey = `${rawId}:${targetTitle}:${targetArtist}`;
+    let cached = cache.get(cacheKey);
+
+    if (!cached || cached.exp <= Date.now()) {
+      let audioUrl = await getSoundCloudStreamUrl(targetTitle ? `${targetArtist} ${targetTitle}` : rawId);
+
+      if (!audioUrl && targetTitle) {
+        audioUrl = await getSoundCloudStreamUrl(targetTitle);
       }
+
+      if (!audioUrl) {
+        audioUrl = await getSoundCloudStreamUrl(rawId);
+      }
+
+      if (!audioUrl) {
+        return NextResponse.json({ error: 'Track stream not found' }, { status: 404 });
+      }
+
+      cached = {
+        source: { url: audioUrl, mimeType: 'audio/mpeg' },
+        exp: Date.now() + 1000 * 60 * 30,
+      };
+      cache.set(cacheKey, cached);
     }
 
-    const rangeHeader = req.headers.get('range');
-    const headers: Record<string, string> = { 'User-Agent': source.userAgent };
-    if (rangeHeader) headers['Range'] = rangeHeader;
+    const range = req.headers.get('range');
+    const upstreamHeaders: Record<string, string> = { 'User-Agent': BROWSER_UA };
+    if (range) upstreamHeaders['Range'] = range;
 
-    const upstream = await fetch(source.url, {
-      method: isHead ? 'HEAD' : 'GET',
-      headers,
+    const upstream = await fetch(cached.source.url, {
+      headers: upstreamHeaders,
     }).catch(() => null);
 
     if (!upstream || (!upstream.ok && upstream.status !== 206)) {
-      streamUrlCache.delete(cacheKey);
-      try {
-        const freshSource = await fetchFromSoundCloud(rawId, targetTitle, targetArtist);
-        source = { ...freshSource, expiresAt: Date.now() + 1000 * 60 * 30 };
-        streamUrlCache.set(cacheKey, source);
-
-        const retryUpstream = await fetch(source.url, {
-          method: isHead ? 'HEAD' : 'GET',
-          headers,
-        });
-        if (!retryUpstream.ok && retryUpstream.status !== 206) {
-          return NextResponse.json({ error: 'Upstream stream failed' }, { status: 502 });
-        }
-        
-        const responseHeaders = new Headers();
-        responseHeaders.set('Content-Type', retryUpstream.headers.get('content-type') || source.mimeType);
-        responseHeaders.set('Accept-Ranges', 'bytes');
-        responseHeaders.set('Cache-Control', 'private, max-age=1800');
-        const cl = retryUpstream.headers.get('content-length');
-        if (cl) responseHeaders.set('Content-Length', cl);
-        const cr = retryUpstream.headers.get('content-range');
-        if (cr) responseHeaders.set('Content-Range', cr);
-
-        return new NextResponse(isHead ? null : retryUpstream.body, {
-          status: retryUpstream.status,
-          headers: responseHeaders,
-        });
-      } catch {
-        return NextResponse.json({ error: 'Upstream stream failed' }, { status: 502 });
-      }
+      cache.delete(cacheKey);
+      return NextResponse.json({ error: 'Upstream stream failed' }, { status: 502 });
     }
 
     const responseHeaders = new Headers();
-    responseHeaders.set('Content-Type', upstream.headers.get('content-type') || source.mimeType);
+    responseHeaders.set('Content-Type', upstream.headers.get('content-type') || cached.source.mimeType);
     responseHeaders.set('Accept-Ranges', 'bytes');
     responseHeaders.set('Cache-Control', 'private, max-age=1800');
 
@@ -190,28 +140,18 @@ async function handleStream(
     const contentRange = upstream.headers.get('content-range');
     if (contentRange) responseHeaders.set('Content-Range', contentRange);
 
-    return new NextResponse(isHead ? null : upstream.body, {
+    return new Response(upstream.body, {
       status: upstream.status,
       headers: responseHeaders,
     });
   } catch (err: any) {
-    return NextResponse.json(
-      { error: err?.message || 'Failed to stream audio' },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: err?.message || 'Server error' }, { status: 500 });
   }
-}
-
-export async function GET(
-  req: NextRequest,
-  context: { params: Promise<{ id: string }> }
-) {
-  return handleStream(req, context, false);
 }
 
 export async function HEAD(
   req: NextRequest,
   context: { params: Promise<{ id: string }> }
 ) {
-  return handleStream(req, context, true);
+  return GET(req, context);
 }

@@ -36,35 +36,51 @@ function jsonToNetscape(jsonStr: string): string {
   return lines.join('\n') + '\n';
 }
 
-function getCookiesFile(): string | null {
-  const raw = process.env.YOUTUBE_COOKIES?.trim();
-  if (!raw) return null;
-  const tmp = path.join('/tmp', 'yt_cookies.txt');
-  try {
-    let text =
-      raw.startsWith('#') || raw.startsWith('[') || raw.startsWith('{')
-        ? raw
-        : Buffer.from(raw, 'base64').toString('utf-8');
-    text = text.trim();
-    if (text.startsWith('[') || text.startsWith('{')) {
-      text = jsonToNetscape(text);
-    }
-    fs.writeFileSync(tmp, text, 'utf-8');
-    return tmp;
-  } catch (e) {
-    console.error('[STREAM] Ошибка куки:', e);
-    return null;
+function prepareCookiesText(raw: string): string {
+  let text = raw.trim();
+  if (!text.startsWith('#') && !text.startsWith('[') && !text.startsWith('{')) {
+    text = Buffer.from(text, 'base64').toString('utf-8').trim();
   }
+  if (text.startsWith('[') || text.startsWith('{')) {
+    text = jsonToNetscape(text);
+  }
+  return text;
+}
+
+function getCookiesFile(): string | null {
+  const tmp = path.join('/tmp', 'yt_cookies.txt');
+  const secretFile = '/etc/secrets/cookies.txt';
+
+  try {
+    if (fs.existsSync(secretFile)) {
+      const rawFile = fs.readFileSync(secretFile, 'utf-8');
+      if (rawFile.trim()) {
+        fs.writeFileSync(tmp, prepareCookiesText(rawFile), 'utf-8');
+        return tmp;
+      }
+    }
+
+    const rawEnv = process.env.YOUTUBE_COOKIES?.trim();
+    if (rawEnv) {
+      fs.writeFileSync(tmp, prepareCookiesText(rawEnv), 'utf-8');
+      return tmp;
+    }
+  } catch (e) {
+    console.error('[STREAM] Ошибка чтения куки:', e);
+  }
+  return null;
 }
 
 async function resolveWithYtDlp(id: string): Promise<string> {
   const start = Date.now();
   const cookies = getCookiesFile();
+  console.log(`[STREAM] Запуск yt-dlp для ${id} (куки: ${cookies ? 'подключены' : 'НЕТ'})`);
+
   const args = [
     '-f', 'bestaudio[ext=m4a]/bestaudio',
     '-g', '--no-warnings', '--no-playlist', '--no-cache-dir',
     '--no-check-certificates', '--geo-bypass',
-    '--extractor-args', 'youtube:player_client=web,mweb',
+    '--extractor-args', 'youtube:player_client=mweb,web',
   ];
   if (cookies) args.push('--cookies', cookies);
   args.push(`https://www.youtube.com/watch?v=${id}`);

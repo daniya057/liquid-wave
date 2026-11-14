@@ -29,11 +29,13 @@ declare global {
   }
 }
 
+const resolvedIdsCache = new Map<string, { id: string; thumbnail: string; duration: number }>();
+
 export function useAudioEngine(onEndedOrOptions?: any) {
   const audioRef = useRef<any>(null);
   const playerRef = useRef<any>(null);
   const readyRef = useRef(false);
-  const pendingRef = useRef<Track | null>(null);
+  const pendingRef = useRef<string | null>(null);
   const errStreakRef = useRef(0);
 
   const onEndedRef = useRef<any>(null);
@@ -60,11 +62,42 @@ export function useAudioEngine(onEndedOrOptions?: any) {
   const stateRef = useRef({ queue, currentIndex });
   stateRef.current = { queue, currentIndex };
 
-  const loadAndPlay = useCallback((track: Track) => {
+  const loadAndPlay = useCallback(async (track: Track) => {
     setError(null);
     setIsLoading(true);
     setCurrentTime(0);
     if (track.duration) setDuration(track.duration);
+
+    let videoId = track.id;
+
+    // Если трек из Spotify (ytq:index:query) — находим его YouTube ID за 0.3 сек
+    if (videoId.startsWith('ytq:')) {
+      const cached = resolvedIdsCache.get(videoId);
+      if (cached) {
+        videoId = cached.id;
+      } else {
+        try {
+          const encodedQuery = videoId.split(':').slice(2).join(':');
+          const res = await fetch(`/api/search?q=${encodedQuery}`);
+          const data = await res.json();
+          const best = data?.tracks?.[0];
+          if (!best?.id) throw new Error('Трек не найден');
+
+          resolvedIdsCache.set(track.id, {
+            id: best.id,
+            thumbnail: best.thumbnail,
+            duration: best.duration || 0,
+          });
+          videoId = best.id;
+          if (!track.thumbnail && best.thumbnail) track.thumbnail = best.thumbnail;
+          if (best.duration) setDuration(best.duration);
+        } catch {
+          setIsLoading(false);
+          setError('Не удалось найти трек');
+          return;
+        }
+      }
+    }
 
     if (typeof navigator !== 'undefined' && 'mediaSession' in navigator && track.title) {
       navigator.mediaSession.metadata = new MediaMetadata({
@@ -76,9 +109,9 @@ export function useAudioEngine(onEndedOrOptions?: any) {
     }
 
     if (readyRef.current && playerRef.current?.loadVideoById) {
-      playerRef.current.loadVideoById({ videoId: track.id, startSeconds: 0 });
+      playerRef.current.loadVideoById({ videoId, startSeconds: 0 });
     } else {
-      pendingRef.current = track;
+      pendingRef.current = videoId;
     }
   }, []);
 
@@ -93,6 +126,7 @@ export function useAudioEngine(onEndedOrOptions?: any) {
       loadAndPlay(q[idx + 1]);
     } else {
       setIsPlaying(false);
+      audioRef.current?.dispatchEvent?.(new Event('ended'));
     }
   }, [loadAndPlay]);
 
@@ -122,9 +156,9 @@ export function useAudioEngine(onEndedOrOptions?: any) {
             readyRef.current = true;
             e.target.setVolume(100);
             if (pendingRef.current) {
-              const t = pendingRef.current;
+              const id = pendingRef.current;
               pendingRef.current = null;
-              e.target.loadVideoById(t.id);
+              e.target.loadVideoById(id);
             }
           },
           onStateChange: (e: any) => {

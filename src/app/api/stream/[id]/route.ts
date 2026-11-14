@@ -6,6 +6,21 @@ export const dynamic = 'force-dynamic';
 const BROWSER_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
+const PIPED_INSTANCES = [
+  'https://pipedapi.kavin.rocks',
+  'https://pipedapi.adminforge.de',
+  'https://api.piped.private.coffee',
+  'https://pipedapi.leptons.xyz',
+  'https://pipedapi.drgns.space',
+];
+
+const INVIDIOUS_INSTANCES = [
+  'https://inv.nadeko.net',
+  'https://invidious.nerdvpn.de',
+  'https://iv.datura.network',
+  'https://invidious.private.coffee',
+];
+
 interface AudioSource {
   url: string;
   mimeType: string;
@@ -22,6 +37,10 @@ interface CachedBuffer {
 
 const streamUrlCache = new Map<string, AudioSource & { expiresAt: number }>();
 const fullAudioBufferCache = new Map<string, CachedBuffer>();
+const ytmLookupCache = new Map<
+  string,
+  { videoId: string; durationSec: number; title: string; artist: string; expiresAt: number }
+>();
 const durationLookupCache = new Map<string, { durationSec: number; expiresAt: number }>();
 let cachedScClientId: { id: string; expiresAt: number } | null = null;
 
@@ -70,6 +89,8 @@ const UNWANTED_MODIFIERS = [
   'loop',
   'extended',
   'ringtone',
+  'reaction',
+  'review',
   'ремикс',
   'концерт',
   'лайв',
@@ -111,6 +132,7 @@ const STOP_WORDS = new Set([
   'hd',
   'hq',
   '4k',
+  'vevo',
 ]);
 
 const CYRILLIC_TO_LATIN: Record<string, string> = {
@@ -171,15 +193,15 @@ function safeDecode(value: string): string {
 
 function stripFeaturingAndTags(raw: string): string {
   return raw
-    .replace(/\((?:feat\.?\vert{}ft\.?\vert{}with\vert{}prod\.?)\s+[^)]+\)/gi, '')
-    .replace(/\[(?:feat\.?\vert{}ft\.?\vert{}with\vert{}prod\.?)\s+[^\]]+\]/gi, '')
+    .replace(/\((?:feat\.?|ft\.?|with|prod\.?)\s+[^)]+\)/gi, '')
+    .replace(/\[(?:feat\.?|ft\.?|with|prod\.?)\s+[^\]]+\]/gi, '')
     .replace(/\s+(?:feat\.?|ft\.?)\s+.+$/i, '')
     .replace(
-      /\((?:official\vert{}music\vert{}lyric\vert{}lyrics\vert{}audio\vert{}video\vert{}visualizer\vert{}hd\vert{}hq\vert{}4k\vert{}8k\vert{}explicit\vert{}clean\vert{}remaster(?:ed)?(?:\s+\d{4})?\vert{}клип\vert{}премьера\vert{}текст\vert{}аудио\vert{}видео)[^)]*\)/gi,
+      /\((?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|remaster(?:ed)?(?:\s+\d{4})?|клип|премьера|текст|аудио|видео)[^)]*\)/gi,
       ''
     )
     .replace(
-      /\[(?:official\vert{}music\vert{}lyric\vert{}lyrics\vert{}audio\vert{}video\vert{}visualizer\vert{}hd\vert{}hq\vert{}4k\vert{}8k\vert{}explicit\vert{}clean\vert{}remaster(?:ed)?(?:\s+\d{4})?\vert{}клип\vert{}премьера\vert{}текст\vert{}аудио\vert{}видео)[^\]]*\]/gi,
+      /\[(?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|remaster(?:ed)?(?:\s+\d{4})?|клип|премьера|текст|аудио|видео)[^\]]*\]/gi,
       ''
     )
     .replace(/\s{2,}/g, ' ')
@@ -189,11 +211,11 @@ function stripFeaturingAndTags(raw: string): string {
 function cleanTrackQuery(raw: string): string {
   return raw
     .replace(
-      /\((?:official\vert{}music\vert{}lyric\vert{}lyrics\vert{}audio\vert{}video\vert{}visualizer\vert{}hd\vert{}hq\vert{}4k\vert{}8k\vert{}explicit\vert{}clean\vert{}клип\vert{}премьера\vert{}текст\vert{}аудио\vert{}видео)[^)]*\)/gi,
+      /\((?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|клип|премьера|текст|аудио|видео)[^)]*\)/gi,
       ''
     )
     .replace(
-      /\[(?:official\vert{}music\vert{}lyric\vert{}lyrics\vert{}audio\vert{}video\vert{}visualizer\vert{}hd\vert{}hq\vert{}4k\vert{}8k\vert{}explicit\vert{}clean\vert{}клип\vert{}премьера\vert{}текст\vert{}аудио\vert{}видео)[^\]]*\]/gi,
+      /\[(?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|клип|премьера|текст|аудио|видео)[^\]]*\]/gi,
       ''
     )
     .replace(/\s{2,}/g, ' ')
@@ -222,6 +244,15 @@ function tokensMatch(token: string, candSet: Set<string>): boolean {
   return false;
 }
 
+function parseDurationSec(text?: string): number {
+  if (!text) return 0;
+  const parts = text.trim().split(':').map(Number);
+  if (parts.some(isNaN)) return 0;
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  return parts[0] || 0;
+}
+
 function hasUnwantedVariant(text: string, allowedQuery: string): boolean {
   const qLower = allowedQuery.toLowerCase();
   const tLower = text.toLowerCase();
@@ -242,8 +273,7 @@ function setBufferCache(key: string, entry: CachedBuffer) {
 }
 
 /**
- * Узнаёт эталонную длительность песни (в секундах) через lrclib.net или iTunes Search API,
- * чтобы даже при импорте из Spotify (где duration=0) точно отличать полную песню от 1-минутного обрезка и 30-минутного микса.
+ * Узнаёт эталонную длительность песни (в секундах) через lrclib.net или iTunes Search API.
  */
 async function lookupReferenceDurationSec(title: string, artist: string): Promise<number> {
   const cleanT = stripFeaturingAndTags(title);
@@ -256,26 +286,27 @@ async function lookupReferenceDurationSec(title: string, artist: string): Promis
     return cached.durationSec;
   }
 
-  // 1. Быстрый запрос в lrclib.net (~150 мс)
   try {
     const url = `https://lrclib.net/api/search?track_name=${encodeURIComponent(cleanT)}&artist_name=${encodeURIComponent(primaryA)}`;
     const res = await fetch(url, { signal: AbortSignal.timeout(2500) });
     if (res.ok) {
       const list = await res.json();
       if (Array.isArray(list) && list.length > 0) {
-        const hit = list.find((item: any) => Number(item?.duration) >= 75 && Number(item?.duration) <= 600);
+        const hit = list.find(
+          (item: any) => Number(item?.duration) >= 75 && Number(item?.duration) <= 600
+        );
         if (hit?.duration) {
           const sec = Math.round(Number(hit.duration));
-          durationLookupCache.set(key, { durationSec: sec, expiresAt: Date.now() + 1000 * 60 * 60 * 24 });
+          durationLookupCache.set(key, {
+            durationSec: sec,
+            expiresAt: Date.now() + 1000 * 60 * 60 * 24,
+          });
           return sec;
         }
       }
     }
-  } catch {
-    // пробуем iTunes
-  }
+  } catch {}
 
-  // 2. Резервный запрос в iTunes Search API (~200 мс)
   try {
     const term = `${primaryA} ${cleanT}`.trim();
     const res = await fetch(
@@ -286,19 +317,18 @@ async function lookupReferenceDurationSec(title: string, artist: string): Promis
       const data = await res.json();
       const results = Array.isArray(data?.results) ? data.results : [];
       const hit = results.find(
-        (r: any) =>
-          Number(r?.trackTimeMillis) >= 75000 &&
-          Number(r?.trackTimeMillis) <= 600000
+        (r: any) => Number(r?.trackTimeMillis) >= 75000 && Number(r?.trackTimeMillis) <= 600000
       );
       if (hit?.trackTimeMillis) {
         const sec = Math.round(Number(hit.trackTimeMillis) / 1000);
-        durationLookupCache.set(key, { durationSec: sec, expiresAt: Date.now() + 1000 * 60 * 60 * 24 });
+        durationLookupCache.set(key, {
+          durationSec: sec,
+          expiresAt: Date.now() + 1000 * 60 * 60 * 24,
+        });
         return sec;
       }
     }
-  } catch {
-    // игнорируем
-  }
+  } catch {}
 
   return 0;
 }
@@ -311,6 +341,7 @@ function scoreCandidateMatch(params: {
   targetArtist: string;
   fallbackQuery: string;
   expectedDurationSec: number;
+  strictArtist?: boolean;
 }): number {
   const {
     candidateTitle,
@@ -320,6 +351,7 @@ function scoreCandidateMatch(params: {
     targetArtist,
     fallbackQuery,
     expectedDurationSec,
+    strictArtist = true,
   } = params;
 
   const allowedContext = `${targetArtist} ${targetTitle} ${fallbackQuery}`.trim();
@@ -337,15 +369,23 @@ function scoreCandidateMatch(params: {
   );
 
   if (candidateDurationSec > 0) {
-    if (!allowsShort && candidateDurationSec < 85 && (expectedDurationSec === 0 || expectedDurationSec >= 90)) {
+    if (
+      !allowsShort &&
+      candidateDurationSec < 85 &&
+      (expectedDurationSec === 0 || expectedDurationSec >= 90)
+    ) {
       return -10000;
     }
-    if (!allowsLong && candidateDurationSec > 600 && (expectedDurationSec === 0 || expectedDurationSec <= 580)) {
+    if (
+      !allowsLong &&
+      candidateDurationSec > 600 &&
+      (expectedDurationSec === 0 || expectedDurationSec <= 580)
+    ) {
       return -10000;
     }
     if (expectedDurationSec > 0) {
       const diff = Math.abs(candidateDurationSec - expectedDurationSec);
-      if (diff > 20) {
+      if (diff > 15) {
         return -10000;
       }
     }
@@ -366,8 +406,7 @@ function scoreCandidateMatch(params: {
   }
 
   const titleRatio = matchedTitleCount / titleTokens.length;
-  const minTitleRatio = titleTokens.length <= 2 ? 1.0 : 0.7;
-  if (matchedTitleCount === 0 || titleRatio < minTitleRatio) {
+  if (matchedTitleCount === 0 || titleRatio < 0.75) {
     return -10000;
   }
 
@@ -381,8 +420,11 @@ function scoreCandidateMatch(params: {
       for (const tok of artistTokens) {
         if (tokensMatch(tok, candAllTokens)) matchedArtistCount++;
       }
-      if (matchedArtistCount > 0) {
-        score += Math.round((matchedArtistCount / artistTokens.length) * 200);
+      const artistRatio = matchedArtistCount / artistTokens.length;
+      if (artistRatio >= 0.5) {
+        score += Math.round(artistRatio * 220);
+      } else if (strictArtist) {
+        return -10000;
       } else {
         const exactDurationMatch =
           expectedDurationSec > 0 &&
@@ -391,7 +433,7 @@ function scoreCandidateMatch(params: {
         if (!exactDurationMatch || titleRatio < 1.0) {
           return -10000;
         }
-        score -= 80;
+        score -= 60;
       }
     }
   }
@@ -399,12 +441,202 @@ function scoreCandidateMatch(params: {
   if (expectedDurationSec > 0 && candidateDurationSec > 0) {
     const diff = Math.abs(candidateDurationSec - expectedDurationSec);
     if (diff <= 3) score += 260;
-    else if (diff <= 7) score += 160;
-    else if (diff <= 14) score += 40;
+    else if (diff <= 6) score += 170;
+    else if (diff <= 10) score += 60;
     else score -= 120;
   }
 
   return score;
+}
+
+/**
+ * Поиск точного студийного трека в каталоге YouTube Music (работает даже с Render).
+ */
+async function searchYoutubeMusicSong(
+  query: string,
+  targetTitle: string,
+  targetArtist: string,
+  expectedDurationSec: number
+): Promise<{ videoId: string; durationSec: number; title: string; artist: string } | null> {
+  const key = `${query.toLowerCase()}|${expectedDurationSec}`;
+  const cached = ytmLookupCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    return {
+      videoId: cached.videoId,
+      durationSec: cached.durationSec,
+      title: cached.title,
+      artist: cached.artist,
+    };
+  }
+
+  try {
+    const res = await fetch('https://music.youtube.com/youtubei/v1/search?prettyPrint=false', {
+      method: 'POST',
+      signal: AbortSignal.timeout(4000),
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': BROWSER_UA,
+        Origin: 'https://music.youtube.com',
+        Referer: 'https://music.youtube.com/',
+      },
+      body: JSON.stringify({
+        context: {
+          client: {
+            clientName: 'WEB_REMIX',
+            clientVersion: '1.20241127.01.00',
+            hl: 'en',
+            gl: 'US',
+          },
+        },
+        query,
+        params: 'EgWKAQIIAWoKEAMQBBAJEAoQBQ%3D%3D',
+      }),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+
+    const tabs = json?.contents?.tabbedSearchResultsRenderer?.tabs || [];
+    const sections = tabs[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [];
+    const candidates: { videoId: string; title: string; artist: string; durationSec: number }[] = [];
+
+    for (const sec of sections) {
+      for (const item of sec?.musicShelfRenderer?.contents || []) {
+        const renderer = item?.musicResponsiveListItemRenderer;
+        if (!renderer) continue;
+
+        const videoId =
+          renderer?.playlistItemData?.videoId ||
+          renderer?.overlay?.musicItemThumbnailOverlayRenderer?.content?.musicPlayButtonRenderer
+            ?.playNavigationEndpoint?.watchEndpoint?.videoId;
+        if (!videoId) continue;
+
+        const flexCols = renderer?.flexColumns || [];
+        const title =
+          flexCols[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs
+            ?.map((r: any) => r.text)
+            .join('') || '';
+        const metaRuns = flexCols[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+        const metaTexts = metaRuns.map((r: any) => String(r.text || '').trim());
+        const artist = metaTexts[0] || '';
+        const durationText = [...metaTexts].reverse().find((t) => /^\d+:\d{2}(:\d{2})?$/.test(t));
+
+        candidates.push({
+          videoId,
+          title,
+          artist,
+          durationSec: parseDurationSec(durationText),
+        });
+      }
+    }
+
+    const best = candidates
+      .map((c) => ({
+        c,
+        score: scoreCandidateMatch({
+          candidateTitle: c.title,
+          candidateArtist: c.artist,
+          candidateDurationSec: c.durationSec,
+          targetTitle,
+          targetArtist,
+          fallbackQuery: query,
+          expectedDurationSec,
+          strictArtist: false,
+        }),
+      }))
+      .filter((x) => x.score >= 280)
+      .sort((a, b) => b.score - a.score)[0]?.c;
+
+    if (!best) return null;
+
+    ytmLookupCache.set(key, {
+      ...best,
+      expiresAt: Date.now() + 1000 * 60 * 60 * 6,
+    });
+    return best;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Получаем оригинальный аудиопоток YouTube через пул Piped / Invidious инстансов (обходит блокировку IP Render).
+ */
+async function fetchFromPipedOrInvidious(videoId: string): Promise<AudioSource> {
+  const fetchPiped = async (baseUrl: string): Promise<AudioSource> => {
+    const res = await fetch(`${baseUrl}/streams/${videoId}`, {
+      signal: AbortSignal.timeout(4000),
+      headers: { 'User-Agent': BROWSER_UA },
+    });
+    if (!res.ok) throw new Error('Piped HTTP ' + res.status);
+    const data = await res.json();
+    const streams: any[] = Array.isArray(data?.audioStreams) ? data.audioStreams : [];
+    const mp4 = streams
+      .filter(
+        (s) =>
+          s?.url &&
+          typeof s?.mimeType === 'string' &&
+          s.mimeType.toLowerCase().includes('audio/mp4') &&
+          !s.videoOnly
+      )
+      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+
+    if (!mp4[0]?.url) throw new Error('No Piped audio/mp4');
+
+    const probe = await fetch(mp4[0].url, {
+      method: 'GET',
+      headers: { Range: 'bytes=0-1023', 'User-Agent': BROWSER_UA },
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!probe.ok && probe.status !== 206) throw new Error('Piped stream blocked');
+
+    return {
+      url: mp4[0].url,
+      mimeType: 'audio/mp4',
+      userAgent: BROWSER_UA,
+      provider: 'youtube',
+      isHls: false,
+    };
+  };
+
+  const fetchInvidious = async (baseUrl: string): Promise<AudioSource> => {
+    const res = await fetch(`${baseUrl}/api/v1/videos/${videoId}`, {
+      signal: AbortSignal.timeout(4000),
+      headers: { 'User-Agent': BROWSER_UA },
+    });
+    if (!res.ok) throw new Error('Invidious HTTP ' + res.status);
+    const data = await res.json();
+    const formats: any[] = Array.isArray(data?.adaptiveFormats) ? data.adaptiveFormats : [];
+    const mp4 = formats
+      .filter(
+        (f) =>
+          f?.url &&
+          typeof f?.type === 'string' &&
+          f.type.toLowerCase().includes('audio/mp4')
+      )
+      .sort((a, b) => Number(b.bitrate || 0) - Number(a.bitrate || 0));
+
+    if (!mp4[0]?.url) throw new Error('No Invidious audio/mp4');
+
+    const probe = await fetch(mp4[0].url, {
+      method: 'GET',
+      headers: { Range: 'bytes=0-1023', 'User-Agent': BROWSER_UA },
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!probe.ok && probe.status !== 206) throw new Error('Invidious stream blocked');
+
+    return {
+      url: mp4[0].url,
+      mimeType: 'audio/mp4',
+      userAgent: BROWSER_UA,
+      provider: 'youtube',
+      isHls: false,
+    };
+  };
+
+  return Promise.any([
+    ...PIPED_INSTANCES.map((u) => fetchPiped(u)),
+    ...INVIDIOUS_INSTANCES.map((u) => fetchInvidious(u)),
+  ]);
 }
 
 async function getSoundCloudClientId(): Promise<string> {
@@ -516,7 +748,12 @@ async function fetchFromSoundCloudQuery(
     .map((item) => {
       const durSec = (item.duration || 0) / 1000;
       const titleStr = String(item.title || '');
-      const artistStr = String(item.user?.username || '');
+      const artistStr = [
+        item.user?.username,
+        item.publisher_metadata?.artist,
+      ]
+        .filter(Boolean)
+        .join(' ');
 
       let score = scoreCandidateMatch({
         candidateTitle: titleStr,
@@ -526,10 +763,10 @@ async function fetchFromSoundCloudQuery(
         targetArtist,
         fallbackQuery: cleanQuery,
         expectedDurationSec,
+        strictArtist: true,
       });
 
       if (score >= 0) {
-        // Предпочитаем треки с прямым progressive MP3 (они поддерживают мгновенную перемотку и Range)
         const hasProgressive = item.media.transcodings.some(
           (t: any) => isSafariCompatibleMp3Transcoding(t) && t?.format?.protocol === 'progressive'
         );
@@ -540,7 +777,7 @@ async function fetchFromSoundCloudQuery(
 
       return { item, score };
     })
-    .filter((entry) => entry.score >= 120)
+    .filter((entry) => entry.score >= 340)
     .sort((a, b) => b.score - a.score)
     .map((entry) => entry.item);
 
@@ -565,9 +802,7 @@ async function fetchFromSoundCloudQuery(
             };
           }
         }
-      } catch {
-        // пробуем hls
-      }
+      } catch {}
     }
 
     const hls = track.media.transcodings.find(
@@ -590,88 +825,13 @@ async function fetchFromSoundCloudQuery(
             };
           }
         }
-      } catch {
-        // пробуем следующий трек
-      }
+      } catch {}
     }
   }
 
-  throw new Error('No full matching MP3 stream on SoundCloud');
+  throw new Error('No exact full match found on SoundCloud');
 }
 
-async function fetchInnerTubeMp4(
-  videoId: string,
-  clientName: string,
-  clientVersion: string,
-  ua: string,
-  extraClient: Record<string, any> = {}
-): Promise<AudioSource> {
-  const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
-    method: 'POST',
-    signal: AbortSignal.timeout(3500),
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': ua,
-    },
-    body: JSON.stringify({
-      videoId,
-      context: {
-        client: {
-          clientName,
-          clientVersion,
-          hl: 'en',
-          gl: 'US',
-          ...extraClient,
-        },
-      },
-      contentCheckOk: true,
-      racyCheckOk: true,
-    }),
-  });
-  if (!res.ok) throw new Error('InnerTube HTTP ' + res.status);
-  const data = await res.json();
-
-  if (data?.playabilityStatus?.status && data.playabilityStatus.status !== 'OK') {
-    throw new Error('Playability: ' + data.playabilityStatus.status);
-  }
-
-  const formats = [
-    ...(data?.streamingData?.adaptiveFormats || []),
-    ...(data?.streamingData?.formats || []),
-  ];
-
-  const mp4Audio = formats
-    .filter(
-      (f: any) =>
-        f.url &&
-        typeof f.mimeType === 'string' &&
-        f.mimeType.toLowerCase().includes('audio/mp4') &&
-        f.audioTrack?.audioIsDefault !== false
-    )
-    .sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0));
-
-  if (!mp4Audio[0]?.url) throw new Error('No audio/mp4 format');
-
-  const probe = await fetch(mp4Audio[0].url, {
-    method: 'GET',
-    headers: { Range: 'bytes=0-1023', 'User-Agent': ua },
-    signal: AbortSignal.timeout(2500),
-  });
-  if (!probe.ok && probe.status !== 206) throw new Error('YouTube stream blocked');
-
-  return {
-    url: mp4Audio[0].url,
-    mimeType: 'audio/mp4',
-    userAgent: ua,
-    provider: 'youtube',
-    isHls: false,
-  };
-}
-
-/**
- * Собирает HLS-сегменты SoundCloud в полноценный MP3-файл с честным Content-Length и Range (206),
- * чтобы <audio> на ПК и iPhone не сбрасывал воспроизведение при перемотке и повторных запросах.
- */
 async function serveHlsAsRangedMp3(
   req: NextRequest,
   cacheKey: string,
@@ -698,7 +858,6 @@ async function serveHlsAsRangedMp3(
     const chunks: Uint8Array[] = [];
     let totalBytes = 0;
 
-    // Скачиваем сегменты параллельными пачками по 6 штук (~0.8 сек на весь 4-минутный MP3)
     for (let i = 0; i < segmentUrls.length; i += 6) {
       const batch = segmentUrls.slice(i, i + 6);
       const buffers = await Promise.all(
@@ -804,28 +963,43 @@ async function getAudioSource(
     }
   }
 
-  // Если передан прямой YouTube videoId — сначала пробуем YouTube
-  if (!rawId.startsWith('ytq:')) {
+  let effectiveDuration = expectedDurationSec;
+  if (!effectiveDuration && resolvedTitle) {
+    effectiveDuration = await lookupReferenceDurationSec(resolvedTitle, resolvedArtist);
+  }
+
+  // 1. Определяем точный студийный YouTube videoId (если передан напрямую или найден через YouTube Music)
+  let videoId: string | null = !rawId.startsWith('ytq:') ? rawId : null;
+
+  if (!videoId && query) {
+    const ytmHit = await searchYoutubeMusicSong(
+      query,
+      resolvedTitle,
+      resolvedArtist,
+      effectiveDuration
+    );
+    if (ytmHit) {
+      videoId = ytmHit.videoId;
+      if (!effectiveDuration && ytmHit.durationSec) {
+        effectiveDuration = ytmHit.durationSec;
+      }
+    }
+  }
+
+  // 2. Пробуем получить оригинальный студийный трек через Piped / Invidious
+  if (videoId) {
     try {
-      const ytSource = await fetchInnerTubeMp4(
-        rawId,
-        'ANDROID_VR',
-        '1.60.19',
-        'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
-        {
-          deviceMake: 'Oculus',
-          deviceModel: 'Quest 3',
-          osName: 'Android',
-          osVersion: '12L',
-          androidSdkVersion: 32,
-        }
-      );
-      streamUrlCache.set(cacheKey, { ...ytSource, expiresAt: Date.now() + 1000 * 60 * 60 });
-      return ytSource;
+      const pipedSource = await fetchFromPipedOrInvidious(videoId);
+      streamUrlCache.set(cacheKey, {
+        ...pipedSource,
+        expiresAt: Date.now() + 1000 * 60 * 60,
+      });
+      return pipedSource;
     } catch {
+      // Если все инстансы недоступны, подтягиваем метаданные (если ещё нет) и идём в SoundCloud
       if (!resolvedTitle) {
         const oembedRes = await fetch(
-          `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${rawId}&format=json`,
+          `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
           { signal: AbortSignal.timeout(3000) }
         ).catch(() => null);
         if (oembedRes?.ok) {
@@ -833,17 +1007,15 @@ async function getAudioSource(
           resolvedTitle = cleanTrackQuery(String(data?.title || ''));
           resolvedArtist = String(data?.author_name || '').replace(/\s*-\s*Topic$/i, '').trim();
           query = `${resolvedArtist} ${resolvedTitle}`.trim();
+          if (!effectiveDuration && resolvedTitle) {
+            effectiveDuration = await lookupReferenceDurationSec(resolvedTitle, resolvedArtist);
+          }
         }
       }
     }
   }
 
-  // Если длительность неизвестна (например, трек из Spotify) — узнаём точную длительность из lrclib/iTunes
-  let effectiveDuration = expectedDurationSec;
-  if (!effectiveDuration && resolvedTitle) {
-    effectiveDuration = await lookupReferenceDurationSec(resolvedTitle, resolvedArtist);
-  }
-
+  // 3. Строгий поиск на SoundCloud (обязательное совпадение артиста, названия и точной длительности)
   const scSource = await fetchFromSoundCloudQuery(
     query,
     resolvedTitle,

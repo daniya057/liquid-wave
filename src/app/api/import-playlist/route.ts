@@ -1,7 +1,6 @@
 // @ts-nocheck
 import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
-import yts from 'yt-search';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
@@ -16,36 +15,56 @@ const BROWSER_HEADERS = {
   'Accept-Language': 'en-US,en;q=0.9',
 };
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+function parseSec(text?: string): number {
+  if (!text) return 0;
+  const p = text.split(':').map(Number);
+  if (p.some(isNaN)) return 0;
+  return p.length === 3 ? p[0] * 3600 + p[1] * 60 + p[2] : p.length === 2 ? p[0] * 60 + p[1] : p[0] || 0;
+}
 
 async function findBestYouTubeMatch(title: string, artist: string): Promise<Track | null> {
   const cleanTitle = title.replace(/\(.*?\)|\[.*?\]/g, '').trim();
   const primaryArtist = artist.split(',')[0]?.trim() || artist;
+  const query = `${primaryArtist} ${cleanTitle || title} audio`.trim();
 
-  const queries = [`${primaryArtist} - ${title}`.trim(), `${title} ${primaryArtist}`.trim()];
-  if (cleanTitle && cleanTitle !== title) {
-    queries.push(`${primaryArtist} - ${cleanTitle}`.trim());
-  }
+  try {
+    const res = await fetch('https://www.youtube.com/youtubei/v1/search?prettyPrint=false', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
+      body: JSON.stringify({
+        context: { client: { clientName: 'WEB', clientVersion: '2.20241126.01.00', hl: 'ru', gl: 'RU' } },
+        query,
+      }),
+      signal: AbortSignal.timeout(4000),
+    });
 
-  for (const q of queries) {
-    try {
-      const res = await yts(q);
-      const best = (res.videos || []).find(
-        (v) => v.videoId && v.seconds >= 25 && v.seconds <= 1500
-      );
-      if (best) {
+    if (!res.ok) return null;
+    const json = await res.json();
+    const sections =
+      json?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents || [];
+
+    for (const sec of sections) {
+      for (const item of sec?.itemSectionRenderer?.contents || []) {
+        const v = item.videoRenderer;
+        if (!v?.videoId) continue;
+        const duration = parseSec(v.lengthText?.simpleText);
+        if (duration > 0 && (duration < 25 || duration > 1500)) continue;
+
         return {
-          id: best.videoId,
-          title: title || best.title,
-          artist: artist || best.author?.name || 'Исполнитель',
-          thumbnail: best.thumbnail || `https://i.ytimg.com/vi/${best.videoId}/mqdefault.jpg`,
-          duration: best.seconds || 0,
+          id: v.videoId,
+          title: title || v.title?.runs?.[0]?.text || 'Без названия',
+          artist:
+            artist ||
+            (v.ownerText?.runs?.[0]?.text || 'Исполнитель').replace(/\s*-\s*Topic$/i, '').trim(),
+          thumbnail: `https://i.ytimg.com/vi/${v.videoId}/mqdefault.jpg`,
+          duration,
         };
       }
-    } catch {
-      continue;
     }
+  } catch {
+    return null;
   }
+
   return null;
 }
 
@@ -54,16 +73,16 @@ async function resolveTracksByQueries(
 ): Promise<Track[]> {
   const tracks: Track[] = [];
   const limited = items.slice(0, 1000);
+  const batchSize = 30;
 
-  for (let i = 0; i < limited.length; i += 12) {
-    const batch = limited.slice(i, i + 12);
+  for (let i = 0; i < limited.length; i += batchSize) {
+    const batch = limited.slice(i, i + batchSize);
     const resolved = await Promise.all(
       batch.map((item) => findBestYouTubeMatch(item.title, item.artist))
     );
     for (const tr of resolved) {
       if (tr) tracks.push(tr);
     }
-    if (i + 12 < limited.length) await sleep(80);
   }
 
   return tracks;
@@ -81,7 +100,7 @@ async function findSpotifyPathfinderQuery(
 
   for (const jsUrl of uniqueUrls) {
     try {
-      const jsRes = await fetch(jsUrl, { headers: BROWSER_HEADERS });
+      const jsRes = await fetch(jsUrl, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(5000) });
       if (!jsRes.ok) continue;
       const jsText = await jsRes.text();
 
@@ -98,7 +117,10 @@ async function findSpotifyPathfinderQuery(
 
         for (const hm of hashMatches) {
           const chunkUrl = `${baseDir}xpui-routes-playlist.${hm[1]}.js`;
-          const chunkRes = await fetch(chunkUrl, { headers: BROWSER_HEADERS });
+          const chunkRes = await fetch(chunkUrl, {
+            headers: BROWSER_HEADERS,
+            signal: AbortSignal.timeout(5000),
+          });
           if (!chunkRes.ok) continue;
           const chunkText = await chunkRes.text();
           const chunkQueryMatch = chunkText.match(queryRegex);
@@ -120,8 +142,14 @@ async function importFromSpotify(url: string): Promise<{ name: string; tracks: T
 
   const [, kind, spotifyId] = match;
   const [pageRes, embedRes] = await Promise.all([
-    fetch(`https://open.spotify.com/${kind}/${spotifyId}`, { headers: BROWSER_HEADERS }),
-    fetch(`https://open.spotify.com/embed/${kind}/${spotifyId}`, { headers: BROWSER_HEADERS }),
+    fetch(`https://open.spotify.com/${kind}/${spotifyId}`, {
+      headers: BROWSER_HEADERS,
+      signal: AbortSignal.timeout(6000),
+    }),
+    fetch(`https://open.spotify.com/embed/${kind}/${spotifyId}`, {
+      headers: BROWSER_HEADERS,
+      signal: AbortSignal.timeout(6000),
+    }),
   ]);
 
   const pageHtml = pageRes.ok ? await pageRes.text() : '';
@@ -191,6 +219,7 @@ async function importFromSpotify(url: string): Promise<{ name: string; tracks: T
             },
           },
         }),
+        signal: AbortSignal.timeout(4000),
       });
       if (ctRes.ok) {
         const ctData = await ctRes.json();
@@ -237,12 +266,10 @@ async function importFromSpotify(url: string): Promise<{ name: string; tracks: T
             operationName: pfQuery.opName,
             extensions: { persistedQuery: { version: 1, sha256Hash: pfQuery.hash } },
           }),
+          signal: AbortSignal.timeout(6000),
         });
 
-        if (!pfRes.ok) {
-          console.error(`Spotify Pathfinder offset=${offset} статус ${pfRes.status}`);
-          break;
-        }
+        if (!pfRes.ok) break;
 
         const pfData = await pfRes.json();
         const content = pfData?.data?.playlistV2?.content;
@@ -282,26 +309,72 @@ async function importFromSpotify(url: string): Promise<{ name: string; tracks: T
   return { name, tracks };
 }
 
-async function importFromYouTube(listId: string): Promise<{ name: string; tracks: Track[] }> {
-  const playlist = await yts({ listId });
-  const seen = new Set<string>();
-  const tracks: Track[] = [];
+function extractYtPlaylistItems(items: any[], tracks: Track[], seen: Set<string>): string | null {
+  let nextToken: string | null = null;
+  for (const item of items || []) {
+    if (item.playlistVideoRenderer) {
+      const v = item.playlistVideoRenderer;
+      const id = v.videoId;
+      const sec = Number(v.lengthSeconds) || parseSec(v.lengthText?.simpleText);
+      if (!id || seen.has(id) || (sec > 0 && (sec < 25 || sec > 1500))) continue;
+      seen.add(id);
+      tracks.push({
+        id,
+        title: v.title?.runs?.map((r: any) => r.text).join('') || v.title?.simpleText || 'Без названия',
+        artist: (v.shortBylineText?.runs?.[0]?.text || 'Исполнитель').replace(/\s*-\s*Topic$/i, '').trim(),
+        thumbnail: `https://i.ytimg.com/vi/${id}/mqdefault.jpg`,
+        duration: sec,
+      });
+    } else if (item.continuationItemRenderer) {
+      nextToken = item.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token || null;
+    }
+  }
+  return nextToken;
+}
 
-  for (const v of playlist.videos || []) {
-    const id = v.videoId;
-    const sec = v.seconds ?? v.duration?.seconds ?? 0;
-    if (!id || seen.has(id) || (sec > 0 && (sec < 25 || sec > 1500))) continue;
-    seen.add(id);
-    tracks.push({
-      id,
-      title: v.title || 'Без названия',
-      artist: v.author?.name || 'Исполнитель',
-      thumbnail: v.thumbnail || `https://i.ytimg.com/vi/${id}/mqdefault.jpg`,
-      duration: sec,
+async function importFromYouTube(listId: string): Promise<{ name: string; tracks: Track[] }> {
+  const browseId = listId.startsWith('VL') ? listId : `VL${listId}`;
+  const client = { clientName: 'WEB', clientVersion: '2.20241126.01.00', hl: 'ru', gl: 'RU' };
+  const headers = { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' };
+
+  const res = await fetch('https://www.youtube.com/youtubei/v1/browse?prettyPrint=false', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ context: { client }, browseId }),
+    signal: AbortSignal.timeout(6000),
+  });
+  const json = await res.json();
+
+  const name =
+    json?.header?.playlistHeaderRenderer?.title?.simpleText ||
+    json?.metadata?.playlistMetadataRenderer?.title ||
+    'Плейлист YouTube';
+
+  const tabs = json?.contents?.twoColumnBrowseResultsRenderer?.tabs || [];
+  const secContents =
+    tabs[0]?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents?.[0]
+      ?.playlistVideoListRenderer?.contents || [];
+
+  const tracks: Track[] = [];
+  const seen = new Set<string>();
+  let token = extractYtPlaylistItems(secContents, tracks, seen);
+
+  let pages = 0;
+  while (token && pages < 5) {
+    pages += 1;
+    const contRes = await fetch('https://www.youtube.com/youtubei/v1/browse?prettyPrint=false', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ context: { client }, continuation: token }),
+      signal: AbortSignal.timeout(5000),
     });
+    const contJson = await contRes.json();
+    const contItems =
+      contJson?.onResponseReceivedActions?.[0]?.appendContinuationItemsAction?.continuationItems || [];
+    token = extractYtPlaylistItems(contItems, tracks, seen);
   }
 
-  return { name: playlist.title || 'Плейлист YouTube', tracks };
+  return { name, tracks };
 }
 
 async function importViaYtDlp(url: string): Promise<{ name: string; tracks: Track[] }> {
@@ -311,7 +384,7 @@ async function importViaYtDlp(url: string): Promise<{ name: string; tracks: Trac
   const { stdout } = await execFileAsync(
     ytDlpPath,
     ['--flat-playlist', '-J', '--no-warnings', url],
-    { timeout: 30000, maxBuffer: 15 * 1024 * 1024 }
+    { timeout: 20000, maxBuffer: 15 * 1024 * 1024 }
   );
 
   const data = JSON.parse(stdout);

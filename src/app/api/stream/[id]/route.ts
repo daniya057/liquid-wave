@@ -23,7 +23,10 @@ interface CachedHeadChunk {
 
 const streamUrlCache = new Map<string, AudioSource & { expiresAt: number }>();
 const headChunkCache = new Map<string, CachedHeadChunk>();
-const resolvedVideoIdCache = new Map<string, { videoId: string; expiresAt: number }>();
+const resolvedSongCache = new Map<
+  string,
+  { videoId: string; durationSec: number; expiresAt: number }
+>();
 let cachedScClientId: { id: string; expiresAt: number } | null = null;
 
 const UNWANTED_MODIFIERS = [
@@ -59,6 +62,18 @@ const UNWANTED_MODIFIERS = [
   'teaser',
   'type beat',
   'beat',
+  'mix',
+  'megamix',
+  'full album',
+  'album',
+  'compilation',
+  'podcast',
+  'radio show',
+  '1 hour',
+  '2 hours',
+  'loop',
+  'extended',
+  'ringtone',
   'ремикс',
   'концерт',
   'лайв',
@@ -70,11 +85,20 @@ const UNWANTED_MODIFIERS = [
   'инструментал',
   'пародия',
   'бит',
+  'микс',
+  'мегамикс',
+  'полный альбом',
+  'альбом',
+  'сборник',
+  'подкаст',
+  'час',
+  'рингтон',
 ];
 
 const STOP_WORDS = new Set([
   'feat',
   'ft',
+  'with',
   'prod',
   'official',
   'audio',
@@ -85,7 +109,62 @@ const STOP_WORDS = new Set([
   'the',
   'and',
   'topic',
+  'explicit',
+  'clean',
+  'remastered',
+  'remaster',
+  'hd',
+  'hq',
+  '4k',
 ]);
+
+const CYRILLIC_TO_LATIN: Record<string, string> = {
+  а: 'a',
+  б: 'b',
+  в: 'v',
+  г: 'g',
+  д: 'd',
+  е: 'e',
+  ё: 'e',
+  ж: 'zh',
+  з: 'z',
+  и: 'i',
+  й: 'y',
+  к: 'k',
+  л: 'l',
+  м: 'm',
+  н: 'n',
+  о: 'o',
+  п: 'p',
+  р: 'r',
+  с: 's',
+  т: 't',
+  у: 'u',
+  ф: 'f',
+  х: 'kh',
+  ц: 'ts',
+  ч: 'ch',
+  ш: 'sh',
+  щ: 'shch',
+  ъ: '',
+  ы: 'y',
+  ь: '',
+  э: 'e',
+  ю: 'yu',
+  я: 'ya',
+};
+
+function transliterate(str: string): string {
+  return str
+    .toLowerCase()
+    .split('')
+    .map((ch) => (CYRILLIC_TO_LATIN[ch] !== undefined ? CYRILLIC_TO_LATIN[ch] : ch))
+    .join('')
+    .replace(/x/g, 'ks')
+    .replace(/ph/g, 'f')
+    .replace(/iy\b/g, 'y')
+    .replace(/ii\b/g, 'i');
+}
 
 function safeDecode(value: string): string {
   try {
@@ -93,6 +172,23 @@ function safeDecode(value: string): string {
   } catch {
     return value;
   }
+}
+
+function stripFeaturingAndTags(raw: string): string {
+  return raw
+    .replace(/\((?:feat\.?|ft\.?|with|prod\.?)\s+[^)]+\)/gi, '')
+    .replace(/\[(?:feat\.?|ft\.?|with|prod\.?)\s+[^\]]+\]/gi, '')
+    .replace(/\s+(?:feat\.?|ft\.?)\s+.+$/i, '')
+    .replace(
+      /\((?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|remaster(?:ed)?(?:\s+\d{4})?|клип|премьера|текст|аудио|видео)[^)]*\)/gi,
+      ''
+    )
+    .replace(
+      /\[(?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|remaster(?:ed)?(?:\s+\d{4})?|клип|премьера|текст|аудио|видео)[^\]]*\]/gi,
+      ''
+    )
+    .replace(/\s{2,}/g, ' ')
+    .trim();
 }
 
 function cleanTrackQuery(raw: string): string {
@@ -114,6 +210,23 @@ function tokenize(text: string): string[] {
   return matches.filter((w) => w.length > 1 && !STOP_WORDS.has(w));
 }
 
+function buildTokenSet(text: string): Set<string> {
+  const set = new Set<string>();
+  for (const tok of tokenize(text)) {
+    set.add(tok);
+    const tr = transliterate(tok);
+    if (tr.length > 1) set.add(tr);
+  }
+  return set;
+}
+
+function tokensMatch(token: string, candSet: Set<string>): boolean {
+  if (candSet.has(token)) return true;
+  const tr = transliterate(token);
+  if (tr.length > 1 && candSet.has(tr)) return true;
+  return false;
+}
+
 function parseDurationSec(text?: string): number {
   if (!text) return 0;
   const parts = text.trim().split(':').map(Number);
@@ -126,7 +239,12 @@ function parseDurationSec(text?: string): number {
 function hasUnwantedVariant(text: string, allowedQuery: string): boolean {
   const qLower = allowedQuery.toLowerCase();
   const tLower = text.toLowerCase();
-  return UNWANTED_MODIFIERS.some((mod) => !qLower.includes(mod) && tLower.includes(mod));
+  return UNWANTED_MODIFIERS.some((mod) => {
+    if (qLower.includes(mod)) return false;
+    const escaped = mod.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`(?:^|[^\\p{L}\\p{N}])${escaped}(?:$|[^\\p{L}\\p{N}])`, 'u');
+    return regex.test(tLower);
+  });
 }
 
 function hasSuspiciousBrackets(title: string, allowedQuery: string): boolean {
@@ -167,60 +285,105 @@ function scoreCandidateMatch(params: {
 
   const allowedContext = `${targetArtist} ${targetTitle} ${fallbackQuery}`.trim();
   const candCombined = `${candidateArtist} ${candidateTitle}`.toLowerCase();
-  const candTokens = new Set(tokenize(candCombined));
-  const candTitleTokens = new Set(tokenize(candidateTitle));
 
-  const titleTokens = tokenize(targetTitle || fallbackQuery);
-  if (titleTokens.length === 0) return -1000;
+  // 1. Жёсткая отсечка ремиксов, миксов, полных альбомов, каверов, замедленных версий и сниппетов
+  if (hasUnwantedVariant(candCombined, allowedContext)) {
+    return -10000;
+  }
+
+  // 2. Жёсткая отсечка обрезанных (1-минутных) и слишком длинных (30-минутных) записей
+  const allowsShort = /(?:^|\s)(?:intro|outro|skit|interlude|интро|аутро|скит|интерлюдия)(?:\s|$)/i.test(
+    allowedContext
+  );
+  const allowsLong = /(?:^|\s)(?:mix|set|album|podcast|live|symphony|микс|сет|альбом|подкаст)(?:\s|$)/i.test(
+    allowedContext
+  );
+
+  if (candidateDurationSec > 0) {
+    if (!allowsShort && candidateDurationSec < 75 && (expectedDurationSec === 0 || expectedDurationSec >= 85)) {
+      return -10000;
+    }
+    if (!allowsLong && candidateDurationSec > 630 && (expectedDurationSec === 0 || expectedDurationSec <= 600)) {
+      return -10000;
+    }
+    if (expectedDurationSec > 0) {
+      const diff = Math.abs(candidateDurationSec - expectedDurationSec);
+      if (diff > 30) {
+        return -10000;
+      }
+    }
+  }
+
+  // 3. Проверка совпадения названия трека (с поддержкой транслита и очисткой feat.)
+  const candAllTokens = buildTokenSet(candCombined);
+  const candTitleTokens = buildTokenSet(stripFeaturingAndTags(candidateTitle));
+
+  const coreTitle = stripFeaturingAndTags(targetTitle) || targetTitle || fallbackQuery;
+  const titleTokens = tokenize(coreTitle);
+  if (titleTokens.length === 0) return -10000;
 
   let matchedTitleCount = 0;
   for (const tok of titleTokens) {
-    if (candTitleTokens.has(tok) || candTokens.has(tok)) {
+    if (tokensMatch(tok, candTitleTokens) || tokensMatch(tok, candAllTokens)) {
       matchedTitleCount++;
     }
   }
 
   const titleRatio = matchedTitleCount / titleTokens.length;
-  // Если не совпало ни одно слово из названия или меньше половины — отбрасываем трек
-  if (matchedTitleCount === 0 || titleRatio < 0.5) {
-    return -1000;
+  const minTitleRatio = titleTokens.length <= 2 ? 1.0 : 0.65;
+  if (matchedTitleCount === 0 || titleRatio < minTitleRatio) {
+    return -10000;
   }
 
-  let score = Math.round(titleRatio * 200);
+  let score = Math.round(titleRatio * 240);
 
+  // 4. Проверка совпадения исполнителя
+  let artistMatched = false;
   if (targetArtist) {
-    const artistTokens = tokenize(targetArtist);
+    const primaryArtist = targetArtist.split(/[,&]|feat\.?|ft\.?/i)[0].trim() || targetArtist;
+    const artistTokens = tokenize(primaryArtist);
     if (artistTokens.length > 0) {
       let matchedArtistCount = 0;
       for (const tok of artistTokens) {
-        if (candTokens.has(tok)) matchedArtistCount++;
+        if (tokensMatch(tok, candAllTokens)) matchedArtistCount++;
       }
       if (matchedArtistCount > 0) {
-        score += Math.round((matchedArtistCount / artistTokens.length) * 180);
+        artistMatched = true;
+        score += Math.round((matchedArtistCount / artistTokens.length) * 200);
       } else {
-        score -= 180;
+        // Если артист вообще не совпал — пропускаем только при точном совпадении длительности и 100% названия (релиз от лейбла)
+        const exactDurationMatch =
+          expectedDurationSec > 0 &&
+          candidateDurationSec > 0 &&
+          Math.abs(candidateDurationSec - expectedDurationSec) <= 3;
+        if (!exactDurationMatch || titleRatio < 1.0) {
+          return -10000;
+        }
+        score -= 100;
       }
     }
   }
 
-  if (hasUnwantedVariant(candCombined, allowedContext)) score -= 450;
-  if (hasSuspiciousBrackets(candidateTitle, allowedContext)) score -= 220;
+  if (hasSuspiciousBrackets(candidateTitle, allowedContext)) {
+    score -= 180;
+  }
 
+  // 5. Бонусы и штрафы за длительность
   if (expectedDurationSec > 0 && candidateDurationSec > 0) {
     const diff = Math.abs(candidateDurationSec - expectedDurationSec);
-    if (diff <= 3) score += 240;
-    else if (diff <= 7) score += 130;
-    else if (diff <= 12) score += 20;
-    else score -= 380;
-  } else if (candidateDurationSec > 480) {
-    score -= 160;
+    if (diff <= 3) score += 260;
+    else if (diff <= 8) score += 160;
+    else if (diff <= 15) score += 40;
+    else score -= 140;
+  } else if (artistMatched && candidateDurationSec >= 90 && candidateDurationSec <= 420) {
+    score += 60;
   }
 
   return score;
 }
 
 function setHeadChunkCache(key: string, entry: CachedHeadChunk) {
-  if (headChunkCache.size >= 10) {
+  if (headChunkCache.size >= 12) {
     const oldestKey = headChunkCache.keys().next().value;
     if (oldestKey) headChunkCache.delete(oldestKey);
   }
@@ -257,6 +420,22 @@ async function warmHeadChunk(cacheKey: string, source: AudioSource) {
     });
   } catch {
     // игнорируем ошибки прогрева
+  }
+}
+
+async function probeAudioUrl(url: string, userAgent: string): Promise<boolean> {
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Range: 'bytes=0-1023',
+        'User-Agent': userAgent,
+      },
+      signal: AbortSignal.timeout(3500),
+    });
+    return res.ok || res.status === 206;
+  } catch {
+    return false;
   }
 }
 
@@ -331,18 +510,18 @@ async function searchYoutubeMusicSongs(query: string) {
   }
 }
 
-async function resolveYtqToVideoId(
+async function resolveSongOnYoutubeMusic(
   rawQuery: string,
   targetTitle: string,
   targetArtist: string,
   expectedDurationSec = 0
-): Promise<string | null> {
+): Promise<{ videoId: string; durationSec: number } | null> {
   const cleanQuery = cleanTrackQuery(rawQuery) || rawQuery;
   const cacheKey = `${cleanQuery.toLowerCase()}:${expectedDurationSec}`;
 
-  const cached = resolvedVideoIdCache.get(cacheKey);
+  const cached = resolvedSongCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
-    return cached.videoId;
+    return { videoId: cached.videoId, durationSec: cached.durationSec };
   }
 
   const songs = await searchYoutubeMusicSongs(cleanQuery);
@@ -361,17 +540,22 @@ async function resolveYtqToVideoId(
         expectedDurationSec,
       }),
     }))
-    .filter((x) => x.score >= 80)
+    .filter((x) => x.score >= 120)
     .sort((a, b) => b.score - a.score);
 
-  const bestId = ranked[0]?.item?.videoId || null;
-  if (bestId) {
-    resolvedVideoIdCache.set(cacheKey, {
-      videoId: bestId,
+  const best = ranked[0]?.item;
+  if (best?.videoId) {
+    const resolved = {
+      videoId: best.videoId,
+      durationSec: best.durationSec || expectedDurationSec,
+    };
+    resolvedSongCache.set(cacheKey, {
+      ...resolved,
       expiresAt: Date.now() + 1000 * 60 * 60 * 6,
     });
+    return resolved;
   }
-  return bestId;
+  return null;
 }
 
 async function getSoundCloudClientId(): Promise<string> {
@@ -392,7 +576,7 @@ async function getSoundCloudClientId(): Promise<string> {
   ]
     .map((m) => m[1])
     .reverse()
-    .slice(0, 12);
+    .slice(0, 14);
 
   for (let i = 0; i < scriptUrls.length; i += 4) {
     const batch = scriptUrls.slice(i, i + 4);
@@ -429,9 +613,25 @@ function isSafariCompatibleMp3Transcoding(t: any): boolean {
   if (t.snipped === true) return false;
   if (t.url.includes('/preview/')) return false;
   const mime = String(t?.format?.mime_type || '').toLowerCase();
-  // Исключаем ogg/opus — iOS Safari их не декодирует
   if (mime.includes('ogg') || mime.includes('opus')) return false;
   return mime.includes('mpeg') || mime.includes('mp4') || mime.includes('aac') || mime === '';
+}
+
+async function searchSoundCloudRaw(query: string, clientId: string): Promise<any[]> {
+  const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=25`;
+  const res = await fetch(searchUrl, {
+    signal: AbortSignal.timeout(6000),
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    },
+  });
+  if (!res.ok) {
+    if (res.status === 401 || res.status === 403) cachedScClientId = null;
+    throw new Error('SC search HTTP ' + res.status);
+  }
+  const data = await res.json();
+  return Array.isArray(data?.collection) ? data.collection : [];
 }
 
 async function fetchFromSoundCloudQuery(
@@ -442,87 +642,98 @@ async function fetchFromSoundCloudQuery(
 ): Promise<AudioSource> {
   const clientId = await getSoundCloudClientId();
   const cleanQuery = cleanTrackQuery(rawQuery) || rawQuery;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 6500);
 
-  try {
-    const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(cleanQuery)}&client_id=${clientId}&limit=20`;
-    const res = await fetch(searchUrl, {
-      signal: controller.signal,
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      },
-    });
-    if (!res.ok) {
-      if (res.status === 401 || res.status === 403) cachedScClientId = null;
-      throw new Error('SC search HTTP ' + res.status);
+  let items = await searchSoundCloudRaw(cleanQuery, clientId);
+
+  // Если с feat. ничего не нашлось — пробуем очищенное название + основного артиста
+  const strippedTitle = stripFeaturingAndTags(targetTitle);
+  const primaryArtist = targetArtist.split(/[,&]|feat\.?|ft\.?/i)[0].trim();
+  const altQuery = `${primaryArtist} ${strippedTitle}`.trim();
+
+  if (altQuery && altQuery.toLowerCase() !== cleanQuery.toLowerCase()) {
+    const moreItems = await searchSoundCloudRaw(altQuery, clientId).catch(() => []);
+    const seenIds = new Set(items.map((it) => it?.id));
+    for (const it of moreItems) {
+      if (it?.id && !seenIds.has(it.id)) {
+        seenIds.add(it.id);
+        items.push(it);
+      }
     }
+  }
 
-    const data = await res.json();
-    const items: any[] = Array.isArray(data?.collection) ? data.collection : [];
+  const rankedTracks = items
+    .filter((item) => {
+      if (!Array.isArray(item?.media?.transcodings)) return false;
+      if (item.policy === 'BLOCK' || item.policy === 'SNIP') return false;
+      const dur = Number(item.duration || 0);
+      const fullDur = Number(item.full_duration || dur);
+      // Отбрасываем 30-60 секундные обрезанные превью SoundCloud Go+
+      if (fullDur - dur > 5000) return false;
+      if (dur < 75000) return false;
+      return true;
+    })
+    .map((item) => {
+      const durSec = (item.duration || 0) / 1000;
+      const titleStr = String(item.title || '');
+      const artistStr = String(item.user?.username || '');
 
-    const rankedTracks = items
-      .filter(
-        (item) =>
-          Array.isArray(item?.media?.transcodings) &&
-          (item.duration || 0) >= 35000 &&
-          item.policy !== 'BLOCK'
-      )
-      .map((item) => {
-        const durSec = (item.duration || 0) / 1000;
-        const titleStr = String(item.title || '');
-        const artistStr = String(item.user?.username || '');
+      let score = scoreCandidateMatch({
+        candidateTitle: titleStr,
+        candidateArtist: artistStr,
+        candidateDurationSec: durSec,
+        targetTitle: cleanTrackQuery(targetTitle),
+        targetArtist,
+        fallbackQuery: cleanQuery,
+        expectedDurationSec,
+      });
 
-        let score = scoreCandidateMatch({
-          candidateTitle: titleStr,
-          candidateArtist: artistStr,
-          candidateDurationSec: durSec,
-          targetTitle: cleanTrackQuery(targetTitle),
-          targetArtist,
-          fallbackQuery: cleanQuery,
-          expectedDurationSec,
-        });
+      if (score >= 0) {
+        if (item.publisher_metadata?.isrc || item.publisher_metadata?.release_title) score += 90;
+        if (item.user?.verified) score += 50;
+      }
 
-        if (score >= 0) {
-          if (item.publisher_metadata?.isrc || item.publisher_metadata?.release_title) score += 90;
-          if (item.user?.verified) score += 50;
-        }
+      return { item, score };
+    })
+    .filter((entry) => entry.score >= 120)
+    .sort((a, b) => b.score - a.score)
+    .map((entry) => entry.item);
 
-        return { item, score };
-      })
-      .filter((entry) => entry.score >= 80)
-      .sort((a, b) => b.score - a.score)
-      .map((entry) => entry.item);
-
-    for (const track of rankedTracks) {
-      const progressive = track.media.transcodings.find(
-        (t: any) => isSafariCompatibleMp3Transcoding(t) && t?.format?.protocol === 'progressive'
-      );
-      if (progressive) {
+  for (const track of rankedTracks) {
+    const progressive = track.media.transcodings.find(
+      (t: any) => isSafariCompatibleMp3Transcoding(t) && t?.format?.protocol === 'progressive'
+    );
+    if (progressive) {
+      try {
         const infoRes = await fetch(`${progressive.url}?client_id=${clientId}`, {
-          signal: controller.signal,
+          signal: AbortSignal.timeout(4000),
         });
         if (infoRes.ok) {
           const info = await infoRes.json();
           if (info?.url && !info.url.includes('/preview/')) {
-            return {
-              url: info.url,
-              mimeType: 'audio/mpeg',
-              userAgent: BROWSER_UA,
-              provider: 'soundcloud',
-              isHls: false,
-            };
+            const ok = await probeAudioUrl(info.url, BROWSER_UA);
+            if (ok) {
+              return {
+                url: info.url,
+                mimeType: 'audio/mpeg',
+                userAgent: BROWSER_UA,
+                provider: 'soundcloud',
+                isHls: false,
+              };
+            }
           }
         }
+      } catch {
+        // пробуем hls или следующий трек
       }
+    }
 
-      const hls = track.media.transcodings.find(
-        (t: any) => isSafariCompatibleMp3Transcoding(t) && t?.format?.protocol === 'hls'
-      );
-      if (hls) {
+    const hls = track.media.transcodings.find(
+      (t: any) => isSafariCompatibleMp3Transcoding(t) && t?.format?.protocol === 'hls'
+    );
+    if (hls) {
+      try {
         const infoRes = await fetch(`${hls.url}?client_id=${clientId}`, {
-          signal: controller.signal,
+          signal: AbortSignal.timeout(4000),
         });
         if (infoRes.ok) {
           const info = await infoRes.json();
@@ -536,13 +747,13 @@ async function fetchFromSoundCloudQuery(
             };
           }
         }
+      } catch {
+        // пробуем следующий трек
       }
     }
-
-    throw new Error('No matching MP3 stream on SoundCloud');
-  } finally {
-    clearTimeout(timer);
   }
+
+  throw new Error('No full matching MP3 stream on SoundCloud');
 }
 
 async function fetchYoutubeMetadataFallback(
@@ -634,11 +845,16 @@ async function fetchInnerTubeMp4(
         (f: any) =>
           f.url &&
           typeof f.mimeType === 'string' &&
-          f.mimeType.toLowerCase().includes('audio/mp4')
+          f.mimeType.toLowerCase().includes('audio/mp4') &&
+          f.audioTrack?.audioIsDefault !== false
       )
       .sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0));
 
     if (!mp4Audio[0]?.url) throw new Error('No audio/mp4 format');
+
+    const isReachable = await probeAudioUrl(mp4Audio[0].url, ua);
+    if (!isReachable) throw new Error('YouTube stream URL returned 403');
+
     return {
       url: mp4Audio[0].url,
       mimeType: 'audio/mp4',
@@ -651,15 +867,55 @@ async function fetchInnerTubeMp4(
   }
 }
 
+async function tryAllYoutubeClients(videoId: string): Promise<AudioSource> {
+  return Promise.any([
+    fetchInnerTubeMp4(
+      videoId,
+      'ANDROID_VR',
+      '1.60.19',
+      'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+      {
+        deviceMake: 'Oculus',
+        deviceModel: 'Quest 3',
+        osName: 'Android',
+        osVersion: '12L',
+        androidSdkVersion: 32,
+      }
+    ),
+    fetchInnerTubeMp4(
+      videoId,
+      'IOS',
+      '19.45.4',
+      'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
+      { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' }
+    ),
+  ]);
+}
+
 async function resolveFallbackSoundCloud(
   rawId: string,
   targetTitle: string,
   targetArtist: string,
   expectedDurationSec = 0
 ): Promise<AudioSource> {
+  let effectiveDuration = expectedDurationSec;
+
+  // Если длительность трека не была передана (например, при импорте плейлиста), узнаём её через YouTube Music
+  if (!effectiveDuration && (targetTitle || rawId.startsWith('ytq:'))) {
+    const lookupQuery = targetTitle
+      ? targetArtist
+        ? `${targetArtist} ${targetTitle}`
+        : targetTitle
+      : safeDecode(rawId.split(':').slice(2).join(':')).trim();
+    const ytm = await resolveSongOnYoutubeMusic(lookupQuery, targetTitle, targetArtist, 0);
+    if (ytm?.durationSec) {
+      effectiveDuration = ytm.durationSec;
+    }
+  }
+
   if (targetTitle) {
     const query = targetArtist ? `${targetArtist} ${targetTitle}` : targetTitle;
-    return fetchFromSoundCloudQuery(query, targetTitle, targetArtist, expectedDurationSec);
+    return fetchFromSoundCloudQuery(query, targetTitle, targetArtist, effectiveDuration);
   }
 
   if (rawId.startsWith('ytq:')) {
@@ -667,11 +923,11 @@ async function resolveFallbackSoundCloud(
     const parts = query.split(' - ');
     const guessArtist = parts.length > 1 ? parts[0].trim() : '';
     const guessTitle = parts.length > 1 ? parts.slice(1).join(' - ').trim() : query;
-    return fetchFromSoundCloudQuery(query, guessTitle, guessArtist, expectedDurationSec);
+    return fetchFromSoundCloudQuery(query, guessTitle, guessArtist, effectiveDuration);
   }
 
   const meta = await fetchYoutubeMetadataFallback(rawId);
-  return fetchFromSoundCloudQuery(meta.query, meta.title, meta.artist, expectedDurationSec);
+  return fetchFromSoundCloudQuery(meta.query, meta.title, meta.artist, effectiveDuration);
 }
 
 async function getAudioSource(
@@ -696,6 +952,7 @@ async function getAudioSource(
   }
 
   let videoId: string | null = rawId;
+  let effectiveDuration = expectedDurationSec;
   let query = targetTitle
     ? targetArtist
       ? `${targetArtist} ${targetTitle}`
@@ -713,43 +970,30 @@ async function getAudioSource(
       resolvedTitle = parts.length > 1 ? parts.slice(1).join(' - ').trim() : rawYtq;
     }
     if (!query) throw new Error('Empty track query');
-    videoId = skipYoutube
-      ? null
-      : await resolveYtqToVideoId(query, resolvedTitle, resolvedArtist, expectedDurationSec);
+
+    const ytmResolved = await resolveSongOnYoutubeMusic(
+      query,
+      resolvedTitle,
+      resolvedArtist,
+      effectiveDuration
+    );
+    videoId = skipYoutube ? null : ytmResolved?.videoId || null;
+    if (!effectiveDuration && ytmResolved?.durationSec) {
+      effectiveDuration = ytmResolved.durationSec;
+    }
   }
 
   let resolved: AudioSource;
 
   if (videoId && !skipYoutube) {
     try {
-      resolved = await Promise.any([
-        fetchInnerTubeMp4(
-          videoId,
-          'ANDROID_VR',
-          '1.60.19',
-          'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
-          {
-            deviceMake: 'Oculus',
-            deviceModel: 'Quest 3',
-            osName: 'Android',
-            osVersion: '12L',
-            androidSdkVersion: 32,
-          }
-        ),
-        fetchInnerTubeMp4(
-          videoId,
-          'IOS',
-          '19.45.4',
-          'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
-          { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' }
-        ),
-      ]);
+      resolved = await tryAllYoutubeClients(videoId);
     } catch {
       resolved = await resolveFallbackSoundCloud(
         rawId,
         resolvedTitle,
         resolvedArtist,
-        expectedDurationSec
+        effectiveDuration
       );
     }
   } else {
@@ -757,7 +1001,7 @@ async function getAudioSource(
       rawId,
       resolvedTitle,
       resolvedArtist,
-      expectedDurationSec
+      effectiveDuration
     );
   }
 
@@ -813,8 +1057,11 @@ async function handleHlsStream(req: NextRequest, m3u8Url: string, isHead: boolea
       try {
         for (const segUrl of segmentUrls) {
           if (req.signal.aborted) break;
-          const segRes = await fetch(segUrl, { signal: req.signal });
-          if (!segRes.ok || !segRes.body) continue;
+          let segRes = await fetch(segUrl, { signal: req.signal }).catch(() => null);
+          if (!segRes || !segRes.ok) {
+            segRes = await fetch(segUrl, { signal: req.signal }).catch(() => null);
+          }
+          if (!segRes || !segRes.ok || !segRes.body) continue;
           const reader = segRes.body.getReader();
           while (true) {
             const { done, value } = await reader.read();
@@ -852,21 +1099,22 @@ async function handleStream(
       return NextResponse.json({ error: 'Missing track id' }, { status: 400 });
     }
 
-    const expectedDurationSec = Number(req.nextUrl.searchParams.get('d') || '0') || 0;
+    const rawDuration = Number(req.nextUrl.searchParams.get('d') || '0') || 0;
+    const expectedDurationSec = rawDuration > 10000 ? Math.round(rawDuration / 1000) : rawDuration;
     const targetTitle = (req.nextUrl.searchParams.get('t') || '').trim();
     const targetArtist = (req.nextUrl.searchParams.get('a') || '').trim();
     const cacheKey = `${rawId}:${expectedDurationSec}`;
 
     if (req.nextUrl.searchParams.get('resolve') === '1') {
-      const videoId = rawId.startsWith('ytq:')
-        ? await resolveYtqToVideoId(
+      const resolved = rawId.startsWith('ytq:')
+        ? await resolveSongOnYoutubeMusic(
             safeDecode(rawId.split(':').slice(2).join(':')).trim(),
             targetTitle,
             targetArtist,
             expectedDurationSec
           )
-        : rawId;
-      return NextResponse.json({ videoId });
+        : { videoId: rawId, durationSec: expectedDurationSec };
+      return NextResponse.json({ videoId: resolved?.videoId || null });
     }
 
     let source = await getAudioSource(rawId, targetTitle, targetArtist, expectedDurationSec);
@@ -890,7 +1138,7 @@ async function handleStream(
         const end = Number(match[2]);
         if (start === 0 && end < cachedHead.bytes.byteLength) {
           const slice = cachedHead.bytes.slice(0, end + 1);
-          return new NextResponse(new Uint8Array(slice), {
+          return new NextResponse(Buffer.from(slice), {
             status: 206,
             headers: {
               'Content-Type': cachedHead.contentType,
@@ -923,34 +1171,20 @@ async function handleStream(
       streamUrlCache.delete(cacheKey);
       headChunkCache.delete(cacheKey);
 
-      if (source.provider === 'youtube') {
-        source = await resolveFallbackSoundCloud(
-          rawId,
-          targetTitle,
-          targetArtist,
-          expectedDurationSec
-        );
-        streamUrlCache.set(cacheKey, {
-          ...source,
-          expiresAt: Date.now() + 1000 * 60 * 60,
-        });
-        if (source.isHls) {
-          return handleHlsStream(req, source.url, isHead);
-        }
-        upstream = await fetchUpstream(source);
-      } else {
-        source = await getAudioSource(
-          rawId,
-          targetTitle,
-          targetArtist,
-          expectedDurationSec,
-          true
-        );
-        if (source.isHls) {
-          return handleHlsStream(req, source.url, isHead);
-        }
-        upstream = await fetchUpstream(source);
+      source = await resolveFallbackSoundCloud(
+        rawId,
+        targetTitle,
+        targetArtist,
+        expectedDurationSec
+      );
+      streamUrlCache.set(cacheKey, {
+        ...source,
+        expiresAt: Date.now() + 1000 * 60 * 60,
+      });
+      if (source.isHls) {
+        return handleHlsStream(req, source.url, isHead);
       }
+      upstream = await fetchUpstream(source);
     }
 
     if (!upstream.ok && upstream.status !== 206) {

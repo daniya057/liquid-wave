@@ -25,7 +25,8 @@ function isIOSDevice(): boolean {
 export function useAudioEngine(onEnded?: () => void) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const onEndedRef = useRef(onEnded);
-  const lastSrcRef = useRef<string>('');
+  const shouldPlayRef = useRef(false);
+  const lastPosUpdateRef = useRef(0);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
@@ -50,6 +51,8 @@ export function useAudioEngine(onEnded?: () => void) {
       const audio = audioRef.current;
       if (!audio) return;
 
+      // На iOS не подключаем Web Audio граф, пока пользователь сам не тронет эквалайзер,
+      // чтобы Safari не глушил звук при блокировке экрана
       if (isIOSDevice() && !forceConnect && !graphConnectedRef.current) {
         return;
       }
@@ -67,8 +70,7 @@ export function useAudioEngine(onEnded?: () => void) {
           ctx.addEventListener('statechange', () => {
             if (
               (ctx.state === 'suspended' || (ctx.state as string) === 'interrupted') &&
-              audioRef.current &&
-              !audioRef.current.paused
+              shouldPlayRef.current
             ) {
               ctx.resume().catch(() => {});
             }
@@ -106,7 +108,7 @@ export function useAudioEngine(onEnded?: () => void) {
           graphConnectedRef.current = true;
         }
       } catch {
-        // Нативный <audio> работает без Web Audio
+        // Нативный <audio> работает напрямую
       }
     },
     [eqGains]
@@ -115,6 +117,27 @@ export function useAudioEngine(onEnded?: () => void) {
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
+
+    const updateMediaPosition = () => {
+      if (
+        typeof navigator !== 'undefined' &&
+        'mediaSession' in navigator &&
+        typeof navigator.mediaSession.setPositionState === 'function' &&
+        audio.duration &&
+        isFinite(audio.duration) &&
+        audio.duration > 0
+      ) {
+        try {
+          navigator.mediaSession.setPositionState({
+            duration: audio.duration,
+            playbackRate: audio.playbackRate || 1,
+            position: Math.min(audio.currentTime || 0, audio.duration),
+          });
+        } catch {
+          // игнорируем
+        }
+      }
+    };
 
     const handlePlay = () => {
       setIsPlaying(true);
@@ -126,11 +149,11 @@ export function useAudioEngine(onEnded?: () => void) {
       ) {
         audioCtxRef.current.resume().catch(() => {});
       }
+      updateMediaPosition();
     };
 
     const handlePause = () => {
       setIsPlaying(false);
-      setIsLoading(false);
     };
 
     const handleWaiting = () => {
@@ -139,12 +162,21 @@ export function useAudioEngine(onEnded?: () => void) {
 
     const handleCanPlay = () => {
       setIsLoading(false);
+      // Если в фоне следующий трек подгрузился с задержкой, дозапускаем его автоматически
+      if (shouldPlayRef.current && audio.paused && !audio.ended) {
+        audio.play().catch(() => {});
+      }
     };
 
     const handleTimeUpdate = () => {
+      const now = Date.now();
       setCurrentTime(audio.currentTime || 0);
       if (audio.duration && isFinite(audio.duration)) {
         setDuration(audio.duration);
+      }
+      if (now - lastPosUpdateRef.current > 2000) {
+        lastPosUpdateRef.current = now;
+        updateMediaPosition();
       }
     };
 
@@ -152,18 +184,19 @@ export function useAudioEngine(onEnded?: () => void) {
       setIsLoading(false);
       if (audio.duration && isFinite(audio.duration)) {
         setDuration(audio.duration);
+        updateMediaPosition();
       }
     };
 
     const handleEnded = () => {
       setIsPlaying(false);
-      setIsLoading(false);
       if (onEndedRef.current) {
         onEndedRef.current();
       }
     };
 
     const handleError = () => {
+      shouldPlayRef.current = false;
       setIsLoading(false);
       setIsPlaying(false);
     };
@@ -173,8 +206,6 @@ export function useAudioEngine(onEnded?: () => void) {
     audio.addEventListener('waiting', handleWaiting);
     audio.addEventListener('canplay', handleCanPlay);
     audio.addEventListener('playing', handleCanPlay);
-    audio.addEventListener('stalled', handleCanPlay);
-    audio.addEventListener('abort', handleCanPlay);
     audio.addEventListener('timeupdate', handleTimeUpdate);
     audio.addEventListener('loadedmetadata', handleLoadedMetadata);
     audio.addEventListener('durationchange', handleLoadedMetadata);
@@ -187,8 +218,6 @@ export function useAudioEngine(onEnded?: () => void) {
       audio.removeEventListener('waiting', handleWaiting);
       audio.removeEventListener('canplay', handleCanPlay);
       audio.removeEventListener('playing', handleCanPlay);
-      audio.removeEventListener('stalled', handleCanPlay);
-      audio.removeEventListener('abort', handleCanPlay);
       audio.removeEventListener('timeupdate', handleTimeUpdate);
       audio.removeEventListener('loadedmetadata', handleLoadedMetadata);
       audio.removeEventListener('durationchange', handleLoadedMetadata);
@@ -204,7 +233,7 @@ export function useAudioEngine(onEnded?: () => void) {
 
       ensureAudioGraph(false);
 
-      lastSrcRef.current = src;
+      shouldPlayRef.current = true;
       setIsLoading(true);
       setCurrentTime(0);
       setDuration(0);
@@ -225,32 +254,25 @@ export function useAudioEngine(onEnded?: () => void) {
 
   const togglePlay = useCallback(async () => {
     const audio = audioRef.current;
-    if (!audio) return;
-
-    const src = audio.currentSrc || audio.src || lastSrcRef.current;
-    if (!src) return;
+    if (!audio || !audio.src) return;
 
     ensureAudioGraph(false);
 
-    if (audio.paused || audio.ended || audio.error) {
-      if (audio.error || audio.readyState === 0 || !audio.src) {
-        audio.src = src;
-      }
-      setIsLoading(true);
+    if (audio.paused) {
+      shouldPlayRef.current = true;
       try {
         await audio.play();
-        setIsPlaying(true);
       } catch {
-        setIsPlaying(false);
-      } finally {
-        setIsLoading(false);
+        // игнорируем
       }
     } else {
+      shouldPlayRef.current = false;
       audio.pause();
     }
   }, [ensureAudioGraph]);
 
   const pause = useCallback(() => {
+    shouldPlayRef.current = false;
     const audio = audioRef.current;
     if (audio && !audio.paused) {
       audio.pause();

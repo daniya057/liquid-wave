@@ -107,9 +107,10 @@ function hasSuspiciousBrackets(title: string, allowedQuery: string): boolean {
   for (const b of brackets) {
     const inner = b.slice(1, -1).trim().toLowerCase();
     if (!inner) continue;
-    const isSafe = /^(official(\s+(audio|video|music\s+video))?|audio|video|lyrics?|lyric\s+video|explicit|clean|remastered(\s+\d{4})?|hd|hq|feat\.?.*|ft\.?.*)$/i.test(
-      inner
-    );
+    const isSafe =
+      /^(official(\s+(audio|video|music\s+video))?|audio|video|lyrics?|lyric\s+video|explicit|clean|remastered(\s+\d{4})?|hd|hq|feat\.?.*|ft\.?.*)$/i.test(
+        inner
+      );
     if (!isSafe && !qLower.includes(inner)) {
       return true;
     }
@@ -374,7 +375,9 @@ async function fetchFromSoundCloudQuery(
         (t: any) => isFullTranscoding(t) && t?.format?.protocol === 'progressive'
       );
       if (progressive) {
-        const infoRes = await fetch(`${progressive.url}?client_id=${clientId}`, { signal: controller.signal });
+        const infoRes = await fetch(`${progressive.url}?client_id=${clientId}`, {
+          signal: controller.signal,
+        });
         if (infoRes.ok) {
           const info = await infoRes.json();
           if (info?.url && !info.url.includes('/preview/')) {
@@ -387,7 +390,9 @@ async function fetchFromSoundCloudQuery(
         (t: any) => isFullTranscoding(t) && t?.format?.protocol === 'hls'
       );
       if (hls) {
-        const infoRes = await fetch(`${hls.url}?client_id=${clientId}`, { signal: controller.signal });
+        const infoRes = await fetch(`${hls.url}?client_id=${clientId}`, {
+          signal: controller.signal,
+        });
         if (infoRes.ok) {
           const info = await infoRes.json();
           if (info?.url && !info.url.includes('/preview/')) {
@@ -413,7 +418,9 @@ async function fetchYoutubeTitleOEmbed(videoId: string): Promise<string> {
   const title = cleanTrackQuery(String(data?.title || ''));
   const author = String(data?.author_name || '').replace(/\s*-\s*Topic$/i, '').trim();
   if (!title) throw new Error('Empty title');
-  return author && !title.toLowerCase().includes(author.toLowerCase()) ? `${author} - ${title}` : title;
+  return author && !title.toLowerCase().includes(author.toLowerCase())
+    ? `${author} ${title}`
+    : title;
 }
 
 async function fetchInnerTubeMp4(
@@ -493,7 +500,6 @@ async function getAudioSource(rawId: string, expectedDurationSec = 0): Promise<A
 
   let resolved: AudioSource;
 
-  // Сначала всегда пытаемся получить официальный студийный трек с YouTube, и только при неудаче идём в SoundCloud
   if (videoId) {
     try {
       resolved = await Promise.any([
@@ -509,7 +515,13 @@ async function getAudioSource(rawId: string, expectedDurationSec = 0): Promise<A
           'ANDROID_VR',
           '1.60.19',
           'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
-          { deviceMake: 'Oculus', deviceModel: 'Quest 3', osName: 'Android', osVersion: '12L', androidSdkVersion: 32 }
+          {
+            deviceMake: 'Oculus',
+            deviceModel: 'Quest 3',
+            osName: 'Android',
+            osVersion: '12L',
+            androidSdkVersion: 32,
+          }
         ),
       ]);
     } catch {
@@ -640,7 +652,6 @@ async function handleStream(
     const rangeHeader = req.headers.get('range');
     const cachedHead = headChunkCache.get(cacheKey);
 
-    // Мгновенно отдаём начальные байты из RAM, если трек был предзагружен
     if (!isHead && rangeHeader && cachedHead && cachedHead.expiresAt > Date.now()) {
       const match = rangeHeader.match(/^bytes=(\d+)-(\d+)$/);
       if (match) {

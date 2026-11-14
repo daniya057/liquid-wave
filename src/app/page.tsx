@@ -221,16 +221,9 @@ export default function HomePage() {
     (track?: Track) => {
       if (!track || isSaved(track.id) || prefetchedIdsRef.current.has(track.id)) return;
       prefetchedIdsRef.current.add(track.id);
-      const durParam = track.duration && track.duration > 0 ? `&d=${Math.round(track.duration)}` : '';
-      const url = `/api/stream/${encodeURIComponent(track.id)}`;
-      fetch(`${url}?prefetch=1${durParam}`)
-        .then(() => {
-          fetch(url, { headers: { Range: 'bytes=0-1' } }).catch(() => {});
-          fetch(url, { headers: { Range: 'bytes=0-262143' } }).catch(() => {});
-        })
-        .catch(() => {
-          prefetchedIdsRef.current.delete(track.id);
-        });
+      fetch(`/api/stream/${track.id}?prefetch=1`).catch(() => {
+        prefetchedIdsRef.current.delete(track.id);
+      });
     },
     [isSaved]
   );
@@ -300,10 +293,7 @@ export default function HomePage() {
           return;
         }
       }
-
-      const durParam =
-        track.duration && track.duration > 0 ? `?d=${Math.round(track.duration)}` : '';
-      await playStream(`/api/stream/${encodeURIComponent(track.id)}${durParam}`);
+      await playStream(`/api/stream/${track.id}`);
     },
     [queue, isShuffled, prefetchTrack, isSaved, getOfflineUrl, playStream]
   );
@@ -312,7 +302,7 @@ export default function HomePage() {
     playTrackRef.current = playTrack;
   }, [playTrack]);
 
-  // Поддержка экрана блокировки iPhone/Android и наушников (Media Session API)
+  // Поддержка экрана блокировки iPhone и наушников (Media Session API)
   useEffect(() => {
     if (!currentTrack || typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
 
@@ -331,17 +321,9 @@ export default function HomePage() {
     navigator.mediaSession.setActionHandler('pause', () => pause());
     navigator.mediaSession.setActionHandler('previoustrack', () => handlePrevTrack());
     navigator.mediaSession.setActionHandler('nexttrack', () => handleNextTrack());
-    try {
-      navigator.mediaSession.setActionHandler('seekto', (details) => {
-        if (typeof details.seekTime === 'number') {
-          seek(details.seekTime);
-        }
-      });
-    } catch {
-      // игнорируем на старых браузерах
-    }
-  }, [currentTrack, isPlaying, togglePlay, pause, handlePrevTrack, handleNextTrack, seek]);
+  }, [currentTrack, isPlaying, togglePlay, pause, handlePrevTrack, handleNextTrack]);
 
+  // Переключение режима перемешивания (Shuffle)
   const toggleShuffle = useCallback(() => {
     setIsShuffled((prev) => {
       const next = !prev;
@@ -361,6 +343,7 @@ export default function HomePage() {
     });
   }, [originalQueue, queue, currentTrack, prefetchTrack]);
 
+  // Запуск любого списка сразу вперемешку
   const playShuffledList = (list: Track[]) => {
     if (list.length === 0) return;
     const shuffled = shuffleTracks(list);
@@ -409,6 +392,7 @@ export default function HomePage() {
     await executeSearch(searchQuery);
   };
 
+  // Поиск треков прямо внутри открытого плейлиста
   const handleInPlaylistSearch = async (e?: React.FormEvent) => {
     e?.preventDefault();
     if (!inPlaylistQuery.trim()) return;
@@ -511,6 +495,7 @@ export default function HomePage() {
     }
   };
 
+  // Импорт плейлиста из Spotify / YouTube Music / YouTube / SoundCloud
   const handleImportPlaylist = async (e?: React.FormEvent) => {
     e?.preventDefault();
     if (!importUrl.trim() || isImporting) return;
@@ -1158,6 +1143,7 @@ export default function HomePage() {
                     <span>Ко всем плейлистам</span>
                   </button>
 
+                  {/* Шапка плейлиста */}
                   <div className="flex flex-col sm:flex-row items-center justify-between gap-4 p-6 rounded-3xl bg-gradient-to-r from-violet-600/20 to-teal-500/20 border border-white/15">
                     <div className="flex items-center gap-4">
                       <div className="w-20 h-20 rounded-2xl overflow-hidden bg-white/10 flex items-center justify-center shrink-0">
@@ -1222,12 +1208,14 @@ export default function HomePage() {
                     </div>
                   </div>
 
+                  {/* Фильтр по настроению */}
                   <MoodFilterBar
                     tracks={activePlaylist.tracks}
                     selectedMood={selectedMood}
                     onSelectMood={handleMoodChange}
                   />
 
+                  {/* Список треков в плейлисте */}
                   {visiblePlaylistTracks.length > 0 && (
                     <div className="space-y-2">
                       {visiblePlaylistTracks.map((t, i) =>
@@ -1236,6 +1224,7 @@ export default function HomePage() {
                     </div>
                   )}
 
+                  {/* УДОБНОЕ ДОБАВЛЕНИЕ ПЕСЕН ПРЯМО ВНУТРИ ПЛЕЙЛИСТА */}
                   <div className="p-5 rounded-3xl bg-white/[0.03] border border-white/10 space-y-4">
                     <div>
                       <h2 className="text-sm font-semibold text-white">
@@ -1367,6 +1356,7 @@ export default function HomePage() {
                     </form>
                   </div>
 
+                  {/* ИМПОРТ ПЛЕЙЛИСТА ИЗ SPOTIFY / YOUTUBE MUSIC / YOUTUBE / SOUNDCLOUD */}
                   <div className="p-4 sm:p-5 rounded-3xl bg-white/[0.03] border border-white/10 space-y-3">
                     <div className="flex items-center gap-2">
                       <Link2 className="w-4 h-4 text-teal-300 shrink-0" />

@@ -1,6 +1,7 @@
 'use client';
-
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { MoodFilterBar } from '@/components/MoodFilterBar';
+import { MoodType, filterTracksByMood } from '@/lib/trackMood';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { Track, Album, Artist, Playlist } from '@/lib/instances';
 import { useAudioEngine } from '@/hooks/useAudioEngine';
 import { useLyrics } from '@/hooks/useLyrics';
@@ -63,6 +64,7 @@ export default function HomePage() {
 
   const [section, setSection] = useState<'explore' | 'playlists' | 'liked' | 'offline'>('explore');
   const [selectedPlaylistId, setSelectedPlaylistId] = useState<string | null>(null);
+  const [selectedMood, setSelectedMood] = useState<MoodType>('all');
 
   // Глобальный поиск
   const [searchQuery, setSearchQuery] = useState('');
@@ -372,6 +374,7 @@ export default function HomePage() {
     setNewPlaylistName('');
     setInPlaylistQuery('');
     setInPlaylistResults([]);
+    setSelectedMood('all');
     if (created?.id) {
       setSelectedPlaylistId(created.id);
     }
@@ -396,6 +399,7 @@ export default function HomePage() {
       }
       const created = importPlaylist(data.name || 'Импортированный плейлист', data.tracks);
       setImportUrl('');
+      setSelectedMood('all');
       if (created?.id) {
         setSelectedPlaylistId(created.id);
       }
@@ -407,6 +411,20 @@ export default function HomePage() {
   };
 
   const activePlaylist: Playlist | undefined = playlists.find((p) => p.id === selectedPlaylistId);
+
+  const visiblePlaylistTracks = useMemo(
+    () => filterTracksByMood(activePlaylist?.tracks || [], selectedMood),
+    [activePlaylist?.tracks, selectedMood]
+  );
+
+  const handleMoodChange = (mood: MoodType) => {
+    setSelectedMood(mood);
+    if (!activePlaylist) return;
+    const filtered = filterTracksByMood(activePlaylist.tracks, mood);
+    if (filtered.length > 0) {
+      playTrack(filtered[0], filtered);
+    }
+  };
 
   const renderTrackRow = (
     track: Track,
@@ -531,6 +549,7 @@ export default function HomePage() {
                   setSection(item.id as typeof section);
                   setSelectedPlaylistId(null);
                   setCollectionView(null);
+                  setSelectedMood('all');
                 }}
                 className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition cursor-pointer ${
                   active
@@ -554,6 +573,7 @@ export default function HomePage() {
               onClick={() => {
                 setSection('playlists');
                 setSelectedPlaylistId(null);
+                setSelectedMood('all');
               }}
               title="Создать или импортировать"
               className="p-1 rounded-lg hover:bg-white/10 text-white/60 hover:text-white cursor-pointer"
@@ -571,6 +591,7 @@ export default function HomePage() {
                   setSelectedPlaylistId(pl.id);
                   setInPlaylistQuery('');
                   setInPlaylistResults([]);
+                  setSelectedMood('all');
                 }}
                 className={`w-full text-left px-3 py-2 rounded-xl text-xs truncate transition cursor-pointer ${
                   section === 'playlists' && selectedPlaylistId === pl.id
@@ -865,7 +886,10 @@ export default function HomePage() {
               {activePlaylist ? (
                 <div className="space-y-6">
                   <button
-                    onClick={() => setSelectedPlaylistId(null)}
+                    onClick={() => {
+                      setSelectedPlaylistId(null);
+                      setSelectedMood('all');
+                    }}
                     className="inline-flex items-center gap-2 text-xs text-white/65 hover:text-white bg-white/[0.06] px-3.5 py-2 rounded-xl border border-white/10 cursor-pointer"
                   >
                     <ArrowLeft className="w-4 h-4" />
@@ -893,17 +917,19 @@ export default function HomePage() {
                         </span>
                         <h1 className="text-2xl font-bold text-white">{activePlaylist.name}</h1>
                         <p className="text-xs text-white/60 mt-1">
-                          {activePlaylist.tracks.length} треков
+                          {selectedMood === 'all'
+                            ? `${activePlaylist.tracks.length} треков`
+                            : `Показано ${visiblePlaylistTracks.length} из ${activePlaylist.tracks.length} треков`}
                         </p>
                       </div>
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2">
-                      {activePlaylist.tracks.length > 0 && (
+                      {visiblePlaylistTracks.length > 0 && (
                         <>
                           <button
                             onClick={() =>
-                              playTrack(activePlaylist.tracks[0], activePlaylist.tracks, false)
+                              playTrack(visiblePlaylistTracks[0], visiblePlaylistTracks, false)
                             }
                             className="inline-flex items-center gap-2 px-5 py-2.5 rounded-full bg-teal-400 text-zinc-950 font-semibold text-xs hover:scale-105 transition cursor-pointer"
                           >
@@ -912,7 +938,7 @@ export default function HomePage() {
                           </button>
 
                           <button
-                            onClick={() => playShuffledList(activePlaylist.tracks)}
+                            onClick={() => playShuffledList(visiblePlaylistTracks)}
                             className="inline-flex items-center gap-2 px-4 py-2.5 rounded-full bg-white/10 hover:bg-white/20 border border-white/15 text-white font-medium text-xs transition cursor-pointer"
                           >
                             <Shuffle className="w-3.5 h-3.5 text-teal-300" />
@@ -925,6 +951,7 @@ export default function HomePage() {
                         onClick={() => {
                           deletePlaylist(activePlaylist.id);
                           setSelectedPlaylistId(null);
+                          setSelectedMood('all');
                         }}
                         title="Удалить плейлист"
                         className="p-2.5 rounded-full bg-white/10 hover:bg-rose-500/25 text-white/70 hover:text-rose-300 transition cursor-pointer"
@@ -934,11 +961,18 @@ export default function HomePage() {
                     </div>
                   </div>
 
+                  {/* Фильтр по настроению */}
+                  <MoodFilterBar
+                    tracks={activePlaylist.tracks}
+                    selectedMood={selectedMood}
+                    onSelectMood={handleMoodChange}
+                  />
+
                   {/* Список треков в плейлисте */}
-                  {activePlaylist.tracks.length > 0 && (
+                  {visiblePlaylistTracks.length > 0 && (
                     <div className="space-y-2">
-                      {activePlaylist.tracks.map((t, i) =>
-                        renderTrackRow(t, activePlaylist.tracks, i, activePlaylist.id)
+                      {visiblePlaylistTracks.map((t, i) =>
+                        renderTrackRow(t, visiblePlaylistTracks, i, activePlaylist.id)
                       )}
                     </div>
                   )}
@@ -1132,6 +1166,7 @@ export default function HomePage() {
                             setSelectedPlaylistId(pl.id);
                             setInPlaylistQuery('');
                             setInPlaylistResults([]);
+                            setSelectedMood('all');
                           }}
                           className="p-3.5 rounded-2xl bg-white/[0.03] hover:bg-white/[0.08] border border-white/10 transition cursor-pointer"
                         >
@@ -1242,6 +1277,7 @@ export default function HomePage() {
                 setSection(item.id as typeof section);
                 setSelectedPlaylistId(null);
                 setCollectionView(null);
+                setSelectedMood('all');
               }}
               className={`flex flex-col items-center justify-center gap-0.5 text-[10px] ${
                 active ? 'text-teal-300 font-semibold' : 'text-white/50'

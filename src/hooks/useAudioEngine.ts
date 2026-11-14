@@ -2,9 +2,9 @@
 
 import { useRef, useState, useEffect, useCallback } from 'react';
 
-const EQ_FREQUENCIES = [60, 230, 910, 3600, 14000];
+export const EQ_FREQUENCIES = [60, 230, 910, 3600, 14000];
 
-const EQ_PRESETS: Record<string, number[]> = {
+export const EQ_PRESETS: Record<string, number[]> = {
   flat: [0, 0, 0, 0, 0],
   bass: [6, 4, 0, -1, 1],
   pop: [-1, 2, 4, 2, -1],
@@ -43,8 +43,6 @@ export function useAudioEngine(onEnded?: () => void) {
     onEndedRef.current = onEnded;
   }, [onEnded]);
 
-  // Ленивая инициализация эквалайзера: не перехватываем нативный аудиопоток на iOS,
-  // пока пользователь сам не изменит эквалайзер, чтобы Safari не глушил фон при блокировке экрана
   const ensureAudioGraph = useCallback(
     (forceConnect = false) => {
       if (typeof window === 'undefined') return;
@@ -113,7 +111,6 @@ export function useAudioEngine(onEnded?: () => void) {
     [eqGains]
   );
 
-  // Синхронизация событий нативного HTMLAudioElement
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;

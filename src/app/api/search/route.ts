@@ -1,111 +1,129 @@
 // @ts-nocheck
 import { NextRequest, NextResponse } from 'next/server';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import path from 'path';
+import fs from 'fs';
 
-let cachedHost = 'https://discoveryprovider.audius.co';
-let hostExpires = 0;
+const execFileAsync = promisify(execFile);
+const urlCache = new Map<string, { url: string; exp: number }>();
+const inFlight = new Map<string, Promise<string>>();
 
-async function getAudiusHost(): Promise<string> {
-  if (Date.now() < hostExpires) return cachedHost;
-  try {
-    const res = await fetch('https://api.audius.co', { signal: AbortSignal.timeout(3000) });
-    const json = await res.json();
-    if (Array.isArray(json?.data) && json.data.length > 0) {
-      cachedHost = json.data[Math.floor(Math.random() * json.data.length)];
-      hostExpires = Date.now() + 10 * 60 * 1000;
-    }
-  } catch {}
-  return cachedHost;
+function getYtDlpPath(): string {
+  const bin = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
+  const local = path.join(process.cwd(), 'node_modules', 'youtube-dl-exec', 'bin', bin);
+  return fs.existsSync(local) ? local : 'yt-dlp';
 }
 
-function mapTracks(items: any[]) {
-  const seen = new Set<string>();
-  const tracks = [];
-  for (const item of items || []) {
-    const id = String(item?.id || '');
-    if (!id || seen.has(id) || item?.is_streamable === false) continue;
-    seen.add(id);
-    tracks.push({
-      id,
-      title: item.title || 'Без названия',
-      artist: item.user?.name || 'Исполнитель',
-      thumbnail: item.artwork?.['480x480'] || item.artwork?.['150x150'] || '',
-      duration: Number(item.duration) || 0,
-    });
+async function getTrackQuery(videoId: string): Promise<string> {
+  const res = await fetch(
+    `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&format=json`,
+    { signal: AbortSignal.timeout(4000) }
+  );
+  if (!res.ok) throw new Error('Не удалось получить название трека');
+  const data = await res.json();
+
+  const cleanTitle = String(data.title || '')
+    .replace(/\(official.*?\)|\[official.*?\]|\(lyrics.*?\)|\[lyrics.*?\]|\(audio.*?\)|\(video.*?\)|\(hd\)|\(4k\)/gi, '')
+    .trim();
+  const cleanAuthor = String(data.author_name || '')
+    .replace(/\s*-\s*Topic$/i, '')
+    .replace(/VEVO$/i, '')
+    .trim();
+
+  if (!cleanTitle) return cleanAuthor;
+  if (cleanAuthor && !cleanTitle.toLowerCase().includes(cleanAuthor.toLowerCase())) {
+    return `${cleanAuthor} - ${cleanTitle}`;
   }
-  return tracks;
+  return cleanTitle;
 }
 
-export async function GET(request: NextRequest) {
-  const { searchParams } = new URL(request.url);
-  const rawQuery = searchParams.get('q')?.trim() || '';
-  const mode = searchParams.get('mode');
-  const listId = searchParams.get('listId')?.trim();
-  const artistName = searchParams.get('artist')?.trim();
+async function resolveStreamUrl(videoId: string): Promise<string> {
+  const cached = urlCache.get(videoId);
+  if (cached && cached.exp > Date.now()) return cached.url;
+  if (inFlight.has(videoId)) return inFlight.get(videoId)!;
+
+  const task = (async () => {
+    const query = await getTrackQuery(videoId);
+    console.log(`[STREAM] Ищу полную версию для "${query}"...`);
+
+    const args = [
+      '-f', 'bestaudio[protocol^=http][protocol!=m3u8][protocol!=m3u8_native]',
+      '--match-filter', 'duration > 60',
+      '--max-downloads', '1',
+      '-g',
+      '--no-warnings',
+      '--no-cache-dir',
+      `scsearch4:${query}`,
+    ];
+
+    let rawOut = '';
+    try {
+      const { stdout } = await execFileAsync(getYtDlpPath(), args, { timeout: 15000 });
+      rawOut = stdout;
+    } catch (err: any) {
+      // yt-dlp при --max-downloads 1 завершается с кодом 101, но ссылка уже в stdout
+      rawOut = err?.stdout || '';
+      if (!rawOut.includes('http')) throw err;
+    }
+
+    const url = rawOut
+      .split('\n')
+      .map((s) => s.trim())
+      .find((s) => s.startsWith('http'));
+
+    if (!url) throw new Error(`Трек "${query}" не найден`);
+
+    urlCache.set(videoId, { url, exp: Date.now() + 2 * 3600 * 1000 });
+    return url;
+  })().finally(() => inFlight.delete(videoId));
+
+  inFlight.set(videoId, task);
+  return task;
+}
+
+export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const { id: pId } = await params;
+  const id = pId || req.nextUrl.pathname.split('/').filter(Boolean).pop();
+  if (!id || ['undefined', 'stream', 'search'].includes(id)) {
+    return NextResponse.json({ error: 'Invalid ID' }, { status: 400 });
+  }
+
+  if (req.nextUrl.searchParams.get('prefetch') === '1') {
+    try {
+      await resolveStreamUrl(id);
+      return NextResponse.json({ ok: true });
+    } catch {
+      return NextResponse.json({ ok: false }, { status: 502 });
+    }
+  }
 
   try {
-    const host = await getAudiusHost();
+    const audioUrl = await resolveStreamUrl(id);
+    const range = req.headers.get('range');
+    const fetchHeaders: HeadersInit = { 'User-Agent': 'Mozilla/5.0' };
+    if (range) fetchHeaders['Range'] = range;
 
-    if (listId) {
-      const res = await fetch(`${host}/v1/playlists/${encodeURIComponent(listId)}/tracks?app_name=LiquidWave`);
-      const json = await res.json();
-      return NextResponse.json({ title: 'Плейлист', tracks: mapTracks(json?.data) });
+    const audioRes = await fetch(audioUrl, { headers: fetchHeaders });
+    if (!audioRes.ok && audioRes.status !== 206) {
+      urlCache.delete(id);
+      return NextResponse.json({ error: 'Stream unavailable' }, { status: 502 });
     }
 
-    if (artistName) {
-      const res = await fetch(
-        `${host}/v1/tracks/search?query=${encodeURIComponent(artistName)}&app_name=LiquidWave`
-      );
-      const json = await res.json();
-      return NextResponse.json({ tracks: mapTracks(json?.data).slice(0, 20), albums: [] });
-    }
+    const headers = new Headers();
+    headers.set('Content-Type', audioRes.headers.get('content-type') || 'audio/mpeg');
+    headers.set('Access-Control-Allow-Origin', '*');
+    headers.set('Accept-Ranges', 'bytes');
+    headers.set('Cache-Control', 'public, max-age=3600');
+    const len = audioRes.headers.get('content-length');
+    const rng = audioRes.headers.get('content-range');
+    if (len) headers.set('Content-Length', len);
+    if (rng) headers.set('Content-Range', rng);
 
-    const isWave = mode === 'wave' || !rawQuery;
-    const endpoint = isWave
-      ? `${host}/v1/tracks/trending?app_name=LiquidWave`
-      : `${host}/v1/tracks/search?query=${encodeURIComponent(rawQuery)}&app_name=LiquidWave`;
-
-    const res = await fetch(endpoint, { signal: AbortSignal.timeout(8000) });
-    const json = await res.json();
-    let tracks = mapTracks(json?.data);
-
-    if (isWave) {
-      tracks = tracks.sort(() => Math.random() - 0.5);
-    }
-    tracks = tracks.slice(0, 25);
-
-    const artistMap = new Map();
-    for (const t of tracks) {
-      const key = t.artist.toLowerCase();
-      if (t.artist && !artistMap.has(key) && artistMap.size < 12) {
-        artistMap.set(key, { id: t.artist, name: t.artist, thumbnail: t.thumbnail });
-      }
-    }
-
-    let albums = [];
-    if (!isWave && rawQuery) {
-      try {
-        const plRes = await fetch(
-          `${host}/v1/playlists/search?query=${encodeURIComponent(rawQuery)}&app_name=LiquidWave`,
-          { signal: AbortSignal.timeout(4000) }
-        );
-        const plJson = await plRes.json();
-        albums = (plJson?.data || []).slice(0, 12).map((p: any) => ({
-          id: String(p.id),
-          title: p.playlist_name || 'Плейлист',
-          artist: p.user?.name || 'Исполнитель',
-          thumbnail: p.artwork?.['480x480'] || p.artwork?.['150x150'] || '',
-          trackCount: p.track_count || undefined,
-        }));
-      } catch {}
-    }
-
-    return NextResponse.json({
-      tracks,
-      albums,
-      artists: Array.from(artistMap.values()),
-    });
-  } catch (err) {
-    console.error('[SEARCH] Ошибка:', err);
-    return NextResponse.json({ tracks: [], albums: [], artists: [] }, { status: 500 });
+    return new NextResponse(audioRes.body, { status: audioRes.status, headers });
+  } catch (err: any) {
+    console.error(`[STREAM] Сбой ${id}:`, err.message);
+    urlCache.delete(id);
+    return NextResponse.json({ error: 'Audio stream error' }, { status: 502 });
   }
 }

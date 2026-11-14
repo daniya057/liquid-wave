@@ -57,6 +57,8 @@ const UNWANTED_MODIFIERS = [
   'parody',
   'snippet',
   'teaser',
+  'type beat',
+  'beat',
   'ремикс',
   'концерт',
   'лайв',
@@ -67,7 +69,23 @@ const UNWANTED_MODIFIERS = [
   'минус',
   'инструментал',
   'пародия',
+  'бит',
 ];
+
+const STOP_WORDS = new Set([
+  'feat',
+  'ft',
+  'prod',
+  'official',
+  'audio',
+  'video',
+  'lyrics',
+  'lyric',
+  'music',
+  'the',
+  'and',
+  'topic',
+]);
 
 function safeDecode(value: string): string {
   try {
@@ -89,6 +107,11 @@ function cleanTrackQuery(raw: string): string {
     )
     .replace(/\s{2,}/g, ' ')
     .trim();
+}
+
+function tokenize(text: string): string[] {
+  const matches = text.toLowerCase().match(/[\p{L}\p{N}]+/gu) || [];
+  return matches.filter((w) => w.length > 1 && !STOP_WORDS.has(w));
 }
 
 function parseDurationSec(text?: string): number {
@@ -121,6 +144,79 @@ function hasSuspiciousBrackets(title: string, allowedQuery: string): boolean {
     }
   }
   return false;
+}
+
+function scoreCandidateMatch(params: {
+  candidateTitle: string;
+  candidateArtist: string;
+  candidateDurationSec: number;
+  targetTitle: string;
+  targetArtist: string;
+  fallbackQuery: string;
+  expectedDurationSec: number;
+}): number {
+  const {
+    candidateTitle,
+    candidateArtist,
+    candidateDurationSec,
+    targetTitle,
+    targetArtist,
+    fallbackQuery,
+    expectedDurationSec,
+  } = params;
+
+  const allowedContext = `${targetArtist} ${targetTitle} ${fallbackQuery}`.trim();
+  const candCombined = `${candidateArtist} ${candidateTitle}`.toLowerCase();
+  const candTokens = new Set(tokenize(candCombined));
+  const candTitleTokens = new Set(tokenize(candidateTitle));
+
+  const titleTokens = tokenize(targetTitle || fallbackQuery);
+  if (titleTokens.length === 0) return -1000;
+
+  let matchedTitleCount = 0;
+  for (const tok of titleTokens) {
+    if (candTitleTokens.has(tok) || candTokens.has(tok)) {
+      matchedTitleCount++;
+    }
+  }
+
+  const titleRatio = matchedTitleCount / titleTokens.length;
+  // Если не совпало ни одно слово из названия или меньше половины — отбрасываем трек
+  if (matchedTitleCount === 0 || titleRatio < 0.5) {
+    return -1000;
+  }
+
+  let score = Math.round(titleRatio * 200);
+
+  if (targetArtist) {
+    const artistTokens = tokenize(targetArtist);
+    if (artistTokens.length > 0) {
+      let matchedArtistCount = 0;
+      for (const tok of artistTokens) {
+        if (candTokens.has(tok)) matchedArtistCount++;
+      }
+      if (matchedArtistCount > 0) {
+        score += Math.round((matchedArtistCount / artistTokens.length) * 180);
+      } else {
+        score -= 180;
+      }
+    }
+  }
+
+  if (hasUnwantedVariant(candCombined, allowedContext)) score -= 450;
+  if (hasSuspiciousBrackets(candidateTitle, allowedContext)) score -= 220;
+
+  if (expectedDurationSec > 0 && candidateDurationSec > 0) {
+    const diff = Math.abs(candidateDurationSec - expectedDurationSec);
+    if (diff <= 3) score += 240;
+    else if (diff <= 7) score += 130;
+    else if (diff <= 12) score += 20;
+    else score -= 380;
+  } else if (candidateDurationSec > 480) {
+    score -= 160;
+  }
+
+  return score;
 }
 
 function setHeadChunkCache(key: string, entry: CachedHeadChunk) {
@@ -160,7 +256,7 @@ async function warmHeadChunk(cacheKey: string, source: AudioSource) {
       expiresAt: Date.now() + 1000 * 60 * 30,
     });
   } catch {
-    // игнорируем ошибки фонового прогрева
+    // игнорируем ошибки прогрева
   }
 }
 
@@ -235,7 +331,12 @@ async function searchYoutubeMusicSongs(query: string) {
   }
 }
 
-async function resolveYtqToVideoId(rawQuery: string, expectedDurationSec = 0): Promise<string | null> {
+async function resolveYtqToVideoId(
+  rawQuery: string,
+  targetTitle: string,
+  targetArtist: string,
+  expectedDurationSec = 0
+): Promise<string | null> {
   const cleanQuery = cleanTrackQuery(rawQuery) || rawQuery;
   const cacheKey = `${cleanQuery.toLowerCase()}:${expectedDurationSec}`;
 
@@ -248,19 +349,19 @@ async function resolveYtqToVideoId(rawQuery: string, expectedDurationSec = 0): P
   if (!songs.length) return null;
 
   const ranked = songs
-    .map((item) => {
-      let score = 150;
-      if (hasUnwantedVariant(`${item.title} ${item.channel}`, cleanQuery)) score -= 400;
-      if (hasSuspiciousBrackets(item.title, cleanQuery)) score -= 220;
-
-      if (expectedDurationSec > 0 && item.durationSec > 0) {
-        const diff = Math.abs(item.durationSec - expectedDurationSec);
-        if (diff <= 4) score += 220;
-        else if (diff <= 8) score += 110;
-        else if (diff > 15) score -= 300;
-      }
-      return { item, score };
-    })
+    .map((item) => ({
+      item,
+      score: scoreCandidateMatch({
+        candidateTitle: item.title,
+        candidateArtist: item.channel,
+        candidateDurationSec: item.durationSec,
+        targetTitle: cleanTrackQuery(targetTitle),
+        targetArtist,
+        fallbackQuery: cleanQuery,
+        expectedDurationSec,
+      }),
+    }))
+    .filter((x) => x.score >= 80)
     .sort((a, b) => b.score - a.score);
 
   const bestId = ranked[0]?.item?.videoId || null;
@@ -323,24 +424,29 @@ async function getSoundCloudClientId(): Promise<string> {
   throw new Error('SoundCloud client_id not found');
 }
 
-function isFullTranscoding(t: any): boolean {
+function isSafariCompatibleMp3Transcoding(t: any): boolean {
   if (!t?.url || typeof t.url !== 'string') return false;
   if (t.snipped === true) return false;
   if (t.url.includes('/preview/')) return false;
-  return true;
+  const mime = String(t?.format?.mime_type || '').toLowerCase();
+  // Исключаем ogg/opus — iOS Safari их не декодирует
+  if (mime.includes('ogg') || mime.includes('opus')) return false;
+  return mime.includes('mpeg') || mime.includes('mp4') || mime.includes('aac') || mime === '';
 }
 
 async function fetchFromSoundCloudQuery(
   rawQuery: string,
+  targetTitle: string,
+  targetArtist: string,
   expectedDurationSec = 0
 ): Promise<AudioSource> {
   const clientId = await getSoundCloudClientId();
   const cleanQuery = cleanTrackQuery(rawQuery) || rawQuery;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 6000);
+  const timer = setTimeout(() => controller.abort(), 6500);
 
   try {
-    const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(cleanQuery)}&client_id=${clientId}&limit=15`;
+    const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(cleanQuery)}&client_id=${clientId}&limit=20`;
     const res = await fetch(searchUrl, {
       signal: controller.signal,
       headers: {
@@ -364,34 +470,34 @@ async function fetchFromSoundCloudQuery(
           item.policy !== 'BLOCK'
       )
       .map((item) => {
-        let score = 100;
         const durSec = (item.duration || 0) / 1000;
         const titleStr = String(item.title || '');
-        const metaBlob = `${titleStr} ${item.tag_list || ''} ${item.user?.username || ''}`;
+        const artistStr = String(item.user?.username || '');
 
-        if (hasUnwantedVariant(metaBlob, cleanQuery)) score -= 400;
-        if (hasSuspiciousBrackets(titleStr, cleanQuery)) score -= 220;
-        if (item.publisher_metadata?.isrc || item.publisher_metadata?.release_title) score += 160;
-        if (item.user?.verified) score += 90;
+        let score = scoreCandidateMatch({
+          candidateTitle: titleStr,
+          candidateArtist: artistStr,
+          candidateDurationSec: durSec,
+          targetTitle: cleanTrackQuery(targetTitle),
+          targetArtist,
+          fallbackQuery: cleanQuery,
+          expectedDurationSec,
+        });
 
-        if (expectedDurationSec > 0) {
-          const diff = Math.abs(durSec - expectedDurationSec);
-          if (diff <= 4) score += 200;
-          else if (diff <= 8) score += 100;
-          else if (diff > 15) score -= 250;
-        } else if (durSec > 450) {
-          score -= 150;
+        if (score >= 0) {
+          if (item.publisher_metadata?.isrc || item.publisher_metadata?.release_title) score += 90;
+          if (item.user?.verified) score += 50;
         }
 
         return { item, score };
       })
-      .filter((entry) => entry.score >= 20)
+      .filter((entry) => entry.score >= 80)
       .sort((a, b) => b.score - a.score)
       .map((entry) => entry.item);
 
     for (const track of rankedTracks) {
       const progressive = track.media.transcodings.find(
-        (t: any) => isFullTranscoding(t) && t?.format?.protocol === 'progressive'
+        (t: any) => isSafariCompatibleMp3Transcoding(t) && t?.format?.protocol === 'progressive'
       );
       if (progressive) {
         const infoRes = await fetch(`${progressive.url}?client_id=${clientId}`, {
@@ -412,7 +518,7 @@ async function fetchFromSoundCloudQuery(
       }
 
       const hls = track.media.transcodings.find(
-        (t: any) => isFullTranscoding(t) && t?.format?.protocol === 'hls'
+        (t: any) => isSafariCompatibleMp3Transcoding(t) && t?.format?.protocol === 'hls'
       );
       if (hls) {
         const infoRes = await fetch(`${hls.url}?client_id=${clientId}`, {
@@ -433,25 +539,50 @@ async function fetchFromSoundCloudQuery(
       }
     }
 
-    throw new Error('No playable stream on SoundCloud');
+    throw new Error('No matching MP3 stream on SoundCloud');
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function fetchYoutubeTitleOEmbed(videoId: string): Promise<string> {
-  const res = await fetch(
-    `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
-    { signal: AbortSignal.timeout(4000) }
-  );
-  if (!res.ok) throw new Error('oEmbed failed');
-  const data = await res.json();
-  const title = cleanTrackQuery(String(data?.title || ''));
-  const author = String(data?.author_name || '').replace(/\s*-\s*Topic$/i, '').trim();
-  if (!title) throw new Error('Empty title');
-  return author && !title.toLowerCase().includes(author.toLowerCase())
-    ? `${author} ${title}`
-    : title;
+async function fetchYoutubeMetadataFallback(
+  videoId: string
+): Promise<{ title: string; artist: string; query: string }> {
+  try {
+    const res = await fetch(
+      `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
+      { signal: AbortSignal.timeout(3500) }
+    );
+    if (res.ok) {
+      const data = await res.json();
+      const title = cleanTrackQuery(String(data?.title || ''));
+      const artist = String(data?.author_name || '').replace(/\s*-\s*Topic$/i, '').trim();
+      if (title) {
+        const query =
+          artist && !title.toLowerCase().includes(artist.toLowerCase())
+            ? `${artist} ${title}`
+            : title;
+        return { title, artist, query };
+      }
+    }
+  } catch {
+    // пробуем вытащить title из страницы YouTube
+  }
+
+  const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    signal: AbortSignal.timeout(4000),
+  });
+  const html = await pageRes.text();
+  const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+  const rawPageTitle = (titleMatch?.[1] || '').replace(/\s*-\s*YouTube\s*$/i, '').trim();
+  const cleaned = cleanTrackQuery(rawPageTitle);
+  if (!cleaned) throw new Error('Unable to resolve track title');
+  return { title: cleaned, artist: '', query: cleaned };
 }
 
 async function fetchInnerTubeMp4(
@@ -522,18 +653,31 @@ async function fetchInnerTubeMp4(
 
 async function resolveFallbackSoundCloud(
   rawId: string,
+  targetTitle: string,
+  targetArtist: string,
   expectedDurationSec = 0
 ): Promise<AudioSource> {
+  if (targetTitle) {
+    const query = targetArtist ? `${targetArtist} ${targetTitle}` : targetTitle;
+    return fetchFromSoundCloudQuery(query, targetTitle, targetArtist, expectedDurationSec);
+  }
+
   if (rawId.startsWith('ytq:')) {
     const query = safeDecode(rawId.split(':').slice(2).join(':')).trim();
-    return fetchFromSoundCloudQuery(query, expectedDurationSec);
+    const parts = query.split(' - ');
+    const guessArtist = parts.length > 1 ? parts[0].trim() : '';
+    const guessTitle = parts.length > 1 ? parts.slice(1).join(' - ').trim() : query;
+    return fetchFromSoundCloudQuery(query, guessTitle, guessArtist, expectedDurationSec);
   }
-  const titleQuery = await fetchYoutubeTitleOEmbed(rawId);
-  return fetchFromSoundCloudQuery(titleQuery, expectedDurationSec);
+
+  const meta = await fetchYoutubeMetadataFallback(rawId);
+  return fetchFromSoundCloudQuery(meta.query, meta.title, meta.artist, expectedDurationSec);
 }
 
 async function getAudioSource(
   rawId: string,
+  targetTitle: string,
+  targetArtist: string,
   expectedDurationSec = 0,
   skipYoutube = false
 ): Promise<AudioSource> {
@@ -552,12 +696,26 @@ async function getAudioSource(
   }
 
   let videoId: string | null = rawId;
-  let query = '';
+  let query = targetTitle
+    ? targetArtist
+      ? `${targetArtist} ${targetTitle}`
+      : targetTitle
+    : '';
+  let resolvedTitle = targetTitle;
+  let resolvedArtist = targetArtist;
 
   if (rawId.startsWith('ytq:')) {
-    query = safeDecode(rawId.split(':').slice(2).join(':')).trim();
+    const rawYtq = safeDecode(rawId.split(':').slice(2).join(':')).trim();
+    if (!query) query = rawYtq;
+    if (!resolvedTitle) {
+      const parts = rawYtq.split(' - ');
+      resolvedArtist = parts.length > 1 ? parts[0].trim() : '';
+      resolvedTitle = parts.length > 1 ? parts.slice(1).join(' - ').trim() : rawYtq;
+    }
     if (!query) throw new Error('Empty track query');
-    videoId = skipYoutube ? null : await resolveYtqToVideoId(query, expectedDurationSec);
+    videoId = skipYoutube
+      ? null
+      : await resolveYtqToVideoId(query, resolvedTitle, resolvedArtist, expectedDurationSec);
   }
 
   let resolved: AudioSource;
@@ -587,12 +745,20 @@ async function getAudioSource(
         ),
       ]);
     } catch {
-      const q = query || (await fetchYoutubeTitleOEmbed(videoId));
-      resolved = await fetchFromSoundCloudQuery(q, expectedDurationSec);
+      resolved = await resolveFallbackSoundCloud(
+        rawId,
+        resolvedTitle,
+        resolvedArtist,
+        expectedDurationSec
+      );
     }
   } else {
-    const q = query || (await fetchYoutubeTitleOEmbed(rawId));
-    resolved = await fetchFromSoundCloudQuery(q, expectedDurationSec);
+    resolved = await resolveFallbackSoundCloud(
+      rawId,
+      resolvedTitle,
+      resolvedArtist,
+      expectedDurationSec
+    );
   }
 
   streamUrlCache.set(cacheKey, {
@@ -687,19 +853,23 @@ async function handleStream(
     }
 
     const expectedDurationSec = Number(req.nextUrl.searchParams.get('d') || '0') || 0;
+    const targetTitle = (req.nextUrl.searchParams.get('t') || '').trim();
+    const targetArtist = (req.nextUrl.searchParams.get('a') || '').trim();
     const cacheKey = `${rawId}:${expectedDurationSec}`;
 
     if (req.nextUrl.searchParams.get('resolve') === '1') {
       const videoId = rawId.startsWith('ytq:')
         ? await resolveYtqToVideoId(
             safeDecode(rawId.split(':').slice(2).join(':')).trim(),
+            targetTitle,
+            targetArtist,
             expectedDurationSec
           )
         : rawId;
       return NextResponse.json({ videoId });
     }
 
-    let source = await getAudioSource(rawId, expectedDurationSec);
+    let source = await getAudioSource(rawId, targetTitle, targetArtist, expectedDurationSec);
 
     if (req.nextUrl.searchParams.get('prefetch') === '1') {
       await warmHeadChunk(cacheKey, source);
@@ -720,7 +890,7 @@ async function handleStream(
         const end = Number(match[2]);
         if (start === 0 && end < cachedHead.bytes.byteLength) {
           const slice = cachedHead.bytes.slice(0, end + 1);
-          return new NextResponse(Buffer.from(slice), {
+          return new NextResponse(new Uint8Array(slice), {
             status: 206,
             headers: {
               'Content-Type': cachedHead.contentType,
@@ -749,13 +919,17 @@ async function handleStream(
 
     let upstream = await fetchUpstream(source);
 
-    // Если YouTube отклонил поток (403/410), сразу переключаемся на SoundCloud и кэшируем рабочий источник
     if (!upstream.ok && upstream.status !== 206) {
       streamUrlCache.delete(cacheKey);
       headChunkCache.delete(cacheKey);
 
       if (source.provider === 'youtube') {
-        source = await resolveFallbackSoundCloud(rawId, expectedDurationSec);
+        source = await resolveFallbackSoundCloud(
+          rawId,
+          targetTitle,
+          targetArtist,
+          expectedDurationSec
+        );
         streamUrlCache.set(cacheKey, {
           ...source,
           expiresAt: Date.now() + 1000 * 60 * 60,
@@ -765,7 +939,13 @@ async function handleStream(
         }
         upstream = await fetchUpstream(source);
       } else {
-        source = await getAudioSource(rawId, expectedDurationSec, true);
+        source = await getAudioSource(
+          rawId,
+          targetTitle,
+          targetArtist,
+          expectedDurationSec,
+          true
+        );
         if (source.isHls) {
           return handleHlsStream(req, source.url, isHead);
         }

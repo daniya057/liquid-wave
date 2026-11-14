@@ -53,6 +53,19 @@ function formatDuration(sec: number): string {
   return `${m}:${s < 10 ? '0' : ''}${s}`;
 }
 
+function buildStreamUrl(track: Track, prefetch = false): string {
+  const params = new URLSearchParams();
+  if (track.title) params.set('t', track.title);
+  if (track.artist) params.set('a', track.artist);
+  if (track.duration && isFinite(track.duration) && track.duration > 0) {
+    params.set('d', String(Math.round(track.duration)));
+  }
+  if (prefetch) params.set('prefetch', '1');
+  const qs = params.toString();
+  const encodedId = encodeURIComponent(track.id);
+  return qs ? `/api/stream/${encodedId}?${qs}` : `/api/stream/${encodedId}`;
+}
+
 function shuffleTracks(list: Track[], keepFirstId?: string): Track[] {
   const copy = [...list];
   let pinned: Track | undefined;
@@ -82,7 +95,6 @@ export default function HomePage() {
   const [selectedPlaylistId, setSelectedPlaylistId] = useState<string | null>(null);
   const [selectedMood, setSelectedMood] = useState<MoodType>('all');
 
-  // Глобальный поиск и подсказки
   const [searchQuery, setSearchQuery] = useState('');
   const [searchTab, setSearchTab] = useState<'all' | 'tracks' | 'albums' | 'artists'>('all');
   const [foundTracks, setFoundTracks] = useState<Track[]>([]);
@@ -95,7 +107,6 @@ export default function HomePage() {
   const [suggestions, setSuggestions] = useState<string[]>(INITIAL_SUGGESTIONS);
   const searchBoxRef = useRef<HTMLDivElement | null>(null);
 
-  // Просмотр альбома или артиста
   const [artistTab, setArtistTab] = useState<'all' | 'tracks' | 'albums'>('all');
   const [collectionView, setCollectionView] = useState<{
     type: 'album' | 'artist';
@@ -107,13 +118,11 @@ export default function HomePage() {
     loading: boolean;
   } | null>(null);
 
-  // Создание и импорт плейлистов
   const [newPlaylistName, setNewPlaylistName] = useState('');
   const [importUrl, setImportUrl] = useState('');
   const [isImporting, setIsImporting] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
 
-  // Поиск и добавление треков прямо внутри открытого плейлиста
   const [inPlaylistQuery, setInPlaylistQuery] = useState('');
   const [inPlaylistResults, setInPlaylistResults] = useState<Track[]>([]);
   const [isInPlaylistSearching, setIsInPlaylistSearching] = useState(false);
@@ -221,7 +230,7 @@ export default function HomePage() {
     (track?: Track) => {
       if (!track || isSaved(track.id) || prefetchedIdsRef.current.has(track.id)) return;
       prefetchedIdsRef.current.add(track.id);
-      fetch(`/api/stream/${track.id}?prefetch=1`).catch(() => {
+      fetch(buildStreamUrl(track, true)).catch(() => {
         prefetchedIdsRef.current.delete(track.id);
       });
     },
@@ -293,7 +302,7 @@ export default function HomePage() {
           return;
         }
       }
-      await playStream(`/api/stream/${track.id}`);
+      await playStream(buildStreamUrl(track, false));
     },
     [queue, isShuffled, prefetchTrack, isSaved, getOfflineUrl, playStream]
   );
@@ -302,7 +311,6 @@ export default function HomePage() {
     playTrackRef.current = playTrack;
   }, [playTrack]);
 
-  // Поддержка экрана блокировки iPhone и наушников (Media Session API)
   useEffect(() => {
     if (!currentTrack || typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
 
@@ -323,7 +331,6 @@ export default function HomePage() {
     navigator.mediaSession.setActionHandler('nexttrack', () => handleNextTrack());
   }, [currentTrack, isPlaying, togglePlay, pause, handlePrevTrack, handleNextTrack]);
 
-  // Переключение режима перемешивания (Shuffle)
   const toggleShuffle = useCallback(() => {
     setIsShuffled((prev) => {
       const next = !prev;
@@ -343,7 +350,6 @@ export default function HomePage() {
     });
   }, [originalQueue, queue, currentTrack, prefetchTrack]);
 
-  // Запуск любого списка сразу вперемешку
   const playShuffledList = (list: Track[]) => {
     if (list.length === 0) return;
     const shuffled = shuffleTracks(list);
@@ -392,7 +398,6 @@ export default function HomePage() {
     await executeSearch(searchQuery);
   };
 
-  // Поиск треков прямо внутри открытого плейлиста
   const handleInPlaylistSearch = async (e?: React.FormEvent) => {
     e?.preventDefault();
     if (!inPlaylistQuery.trim()) return;
@@ -495,7 +500,6 @@ export default function HomePage() {
     }
   };
 
-  // Импорт плейлиста из Spotify / YouTube Music / YouTube / SoundCloud
   const handleImportPlaylist = async (e?: React.FormEvent) => {
     e?.preventDefault();
     if (!importUrl.trim() || isImporting) return;
@@ -645,7 +649,6 @@ export default function HomePage() {
     <div className="min-h-screen bg-[#09090b] text-white flex flex-col md:flex-row selection:bg-teal-500/30">
       <audio ref={audioRef} preload="auto" playsInline />
 
-      {/* БОКОВАЯ ПАНЕЛЬ ДЛЯ КОМПЬЮТЕРА (ПК) */}
       <aside className="hidden md:flex flex-col w-64 shrink-0 bg-[#0c0c10] border-r border-white/10 p-5 pb-28 sticky top-0 h-screen">
         <div className="flex items-center gap-2.5 mb-7 px-2">
           <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-violet-600 to-teal-400 flex items-center justify-center shadow-lg">
@@ -730,7 +733,6 @@ export default function HomePage() {
         </div>
       </aside>
 
-      {/* ОСНОВНАЯ ОБЛАСТЬ КОНТЕНТА */}
       <main className="flex-1 min-w-0 pb-36 md:pb-32">
         <div className="sticky top-0 z-20 bg-[#09090b]/85 backdrop-blur-xl border-b border-white/[0.07] px-4 sm:px-8 py-4">
           <div className="max-w-5xl mx-auto flex items-center gap-3">
@@ -773,7 +775,6 @@ export default function HomePage() {
                 </button>
               </form>
 
-              {/* ВЫПАДАЮЩИЕ ПОДСКАЗКИ ДО ВВОДА И ВО ВРЕМЯ ВВОДА */}
               {isSearchFocused && (
                 <div className="absolute left-0 right-0 mt-2 rounded-2xl bg-[#121218]/98 backdrop-blur-2xl border border-white/15 shadow-2xl overflow-hidden z-40">
                   {!searchQuery.trim() && recentSearches.length > 0 && (
@@ -825,7 +826,6 @@ export default function HomePage() {
         </div>
 
         <div className="max-w-5xl mx-auto px-4 sm:px-8 py-6 space-y-6">
-          {/* ==================== РАЗДЕЛ 1: ПОИСК И ОБЗОР ==================== */}
           {section === 'explore' && (
             <>
               {collectionView ? (
@@ -893,7 +893,6 @@ export default function HomePage() {
                     </div>
                   </div>
 
-                  {/* Вкладки у исполнителя: Всё / Все песни / Альбомы и релизы */}
                   {collectionView.type === 'artist' && !collectionView.loading && (
                     <div className="flex items-center gap-2 overflow-x-auto pb-1">
                       {[
@@ -926,7 +925,6 @@ export default function HomePage() {
                     </div>
                   ) : (
                     <>
-                      {/* Блок альбомов и синглов артиста */}
                       {collectionView.type === 'artist' &&
                         (artistTab === 'all' || artistTab === 'albums') &&
                         collectionView.albums &&
@@ -969,7 +967,6 @@ export default function HomePage() {
                           </div>
                         )}
 
-                      {/* Блок всех песен артиста или треклист альбома */}
                       {(collectionView.type === 'album' ||
                         artistTab === 'all' ||
                         artistTab === 'tracks') &&
@@ -1127,7 +1124,6 @@ export default function HomePage() {
             </>
           )}
 
-          {/* ==================== РАЗДЕЛ 2: ПЛЕЙЛИСТЫ ==================== */}
           {section === 'playlists' && (
             <div className="space-y-6">
               {activePlaylist ? (
@@ -1143,7 +1139,6 @@ export default function HomePage() {
                     <span>Ко всем плейлистам</span>
                   </button>
 
-                  {/* Шапка плейлиста */}
                   <div className="flex flex-col sm:flex-row items-center justify-between gap-4 p-6 rounded-3xl bg-gradient-to-r from-violet-600/20 to-teal-500/20 border border-white/15">
                     <div className="flex items-center gap-4">
                       <div className="w-20 h-20 rounded-2xl overflow-hidden bg-white/10 flex items-center justify-center shrink-0">
@@ -1208,14 +1203,12 @@ export default function HomePage() {
                     </div>
                   </div>
 
-                  {/* Фильтр по настроению */}
                   <MoodFilterBar
                     tracks={activePlaylist.tracks}
                     selectedMood={selectedMood}
                     onSelectMood={handleMoodChange}
                   />
 
-                  {/* Список треков в плейлисте */}
                   {visiblePlaylistTracks.length > 0 && (
                     <div className="space-y-2">
                       {visiblePlaylistTracks.map((t, i) =>
@@ -1224,7 +1217,6 @@ export default function HomePage() {
                     </div>
                   )}
 
-                  {/* УДОБНОЕ ДОБАВЛЕНИЕ ПЕСЕН ПРЯМО ВНУТРИ ПЛЕЙЛИСТА */}
                   <div className="p-5 rounded-3xl bg-white/[0.03] border border-white/10 space-y-4">
                     <div>
                       <h2 className="text-sm font-semibold text-white">
@@ -1356,7 +1348,6 @@ export default function HomePage() {
                     </form>
                   </div>
 
-                  {/* ИМПОРТ ПЛЕЙЛИСТА ИЗ SPOTIFY / YOUTUBE MUSIC / YOUTUBE / SOUNDCLOUD */}
                   <div className="p-4 sm:p-5 rounded-3xl bg-white/[0.03] border border-white/10 space-y-3">
                     <div className="flex items-center gap-2">
                       <Link2 className="w-4 h-4 text-teal-300 shrink-0" />
@@ -1437,7 +1428,6 @@ export default function HomePage() {
             </div>
           )}
 
-          {/* ==================== РАЗДЕЛ 3: ИЗБРАННОЕ ==================== */}
           {section === 'liked' && (
             <div className="space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1474,7 +1464,6 @@ export default function HomePage() {
             </div>
           )}
 
-          {/* ==================== РАЗДЕЛ 4: ОФЛАЙН ==================== */}
           {section === 'offline' && (
             <div className="space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1504,7 +1493,6 @@ export default function HomePage() {
         </div>
       </main>
 
-      {/* НИЖНЯЯ НАВИГАЦИЯ ДЛЯ ТЕЛЕФОНА */}
       <nav className="md:hidden fixed bottom-0 inset-x-0 h-14 bg-[#0c0c10]/95 backdrop-blur-2xl border-t border-white/10 grid grid-cols-4 z-30">
         {[
           { id: 'explore', label: 'Поиск', icon: Search },
@@ -1534,7 +1522,6 @@ export default function HomePage() {
         })}
       </nav>
 
-      {/* АДАПТИВНЫЙ ПЛЕЕР (ПК + ТЕЛЕФОН) */}
       <PlayerBar
         track={currentTrack}
         isPlaying={isPlaying}
@@ -1559,7 +1546,6 @@ export default function HomePage() {
         onOpenDrawer={setActiveDrawer}
       />
 
-      {/* Окно добавления трека в плейлист */}
       <PlaylistModal
         track={playlistModalTrack}
         playlists={playlists}
@@ -1568,7 +1554,6 @@ export default function HomePage() {
         onToggleTrack={toggleTrackInPlaylist}
       />
 
-      {/* Выезжающие шторки (Текст, Эквалайзер, Таймер сна) */}
       <BottomDrawers
         activeDrawer={activeDrawer}
         onClose={() => setActiveDrawer(null)}

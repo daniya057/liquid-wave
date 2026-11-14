@@ -20,13 +20,11 @@ export default function RootLayout({
           aria-hidden="true"
           style={{
             position: 'fixed',
-            bottom: 0,
-            right: 0,
-            width: '1px',
-            height: '1px',
-            opacity: 0.01,
+            top: '0px',
+            left: '-9999px',
+            width: '320px',
+            height: '180px',
             pointerEvents: 'none',
-            zIndex: -1,
           }}
         />
       </body>

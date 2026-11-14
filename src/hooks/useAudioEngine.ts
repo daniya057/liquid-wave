@@ -31,12 +31,41 @@ declare global {
 
 const resolvedIdsCache = new Map<string, { id: string; thumbnail: string; duration: number }>();
 
+// Генерируем тихий WAV-файл в памяти, чтобы iOS/Android не усыпляли аудиосессию при блокировке экрана
+function createSilentAudioUrl(): string {
+  if (typeof window === 'undefined') return '';
+  const sampleRate = 8000;
+  const numSamples = sampleRate * 2;
+  const buffer = new ArrayBuffer(44 + numSamples);
+  const view = new DataView(buffer);
+  const writeStr = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  };
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + numSamples, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate, true);
+  view.setUint16(32, 1, true);
+  view.setUint16(34, 8, true);
+  writeStr(36, 'data');
+  view.setUint32(40, numSamples, true);
+  for (let i = 44; i < 44 + numSamples; i++) view.setUint8(i, 128);
+  return URL.createObjectURL(new Blob([buffer], { type: 'audio/wav' }));
+}
+
 export function useAudioEngine(onEndedOrOptions?: any) {
   const audioRef = useRef<any>(null);
   const playerRef = useRef<any>(null);
   const readyRef = useRef(false);
   const pendingRef = useRef<string | null>(null);
   const errStreakRef = useRef(0);
+  const shouldBePlayingRef = useRef(false);
+  const silentUrlRef = useRef<string>('');
 
   const onEndedRef = useRef<any>(null);
   onEndedRef.current =
@@ -62,15 +91,31 @@ export function useAudioEngine(onEndedOrOptions?: any) {
   const stateRef = useRef({ queue, currentIndex });
   stateRef.current = { queue, currentIndex };
 
+  const syncBackgroundAudio = useCallback((play: boolean) => {
+    shouldBePlayingRef.current = play;
+    const el = audioRef.current;
+    if (!el) return;
+    if (play) {
+      if (!silentUrlRef.current) silentUrlRef.current = createSilentAudioUrl();
+      if (el.src !== silentUrlRef.current) {
+        el.src = silentUrlRef.current;
+        el.loop = true;
+      }
+      el.play().catch(() => {});
+    } else {
+      el.pause();
+    }
+  }, []);
+
   const loadAndPlay = useCallback(async (track: Track) => {
     setError(null);
     setIsLoading(true);
     setCurrentTime(0);
     if (track.duration) setDuration(track.duration);
+    syncBackgroundAudio(true);
 
     let videoId = track.id;
 
-    // Если трек из Spotify (ytq:index:query) — находим его YouTube ID за 0.3 сек
     if (videoId.startsWith('ytq:')) {
       const cached = resolvedIdsCache.get(videoId);
       if (cached) {
@@ -110,10 +155,13 @@ export function useAudioEngine(onEndedOrOptions?: any) {
 
     if (readyRef.current && playerRef.current?.loadVideoById) {
       playerRef.current.loadVideoById({ videoId, startSeconds: 0 });
+      setTimeout(() => {
+        if (shouldBePlayingRef.current) playerRef.current?.playVideo?.();
+      }, 250);
     } else {
       pendingRef.current = videoId;
     }
-  }, []);
+  }, [syncBackgroundAudio]);
 
   const playNext = useCallback(() => {
     if (onEndedRef.current) {
@@ -126,9 +174,10 @@ export function useAudioEngine(onEndedOrOptions?: any) {
       loadAndPlay(q[idx + 1]);
     } else {
       setIsPlaying(false);
+      syncBackgroundAudio(false);
       audioRef.current?.dispatchEvent?.(new Event('ended'));
     }
-  }, [loadAndPlay]);
+  }, [loadAndPlay, syncBackgroundAudio]);
 
   const playPrev = useCallback(() => {
     const { queue: q, currentIndex: idx } = stateRef.current;
@@ -148,8 +197,8 @@ export function useAudioEngine(onEndedOrOptions?: any) {
     const init = () => {
       if (playerRef.current || !document.getElementById('yt-global-player')) return;
       playerRef.current = new window.YT.Player('yt-global-player', {
-        height: '1',
-        width: '1',
+        height: '180',
+        width: '320',
         playerVars: { autoplay: 1, controls: 0, disablekb: 1, fs: 0, modestbranding: 1, playsinline: 1, rel: 0 },
         events: {
           onReady: (e: any) => {
@@ -166,11 +215,18 @@ export function useAudioEngine(onEndedOrOptions?: any) {
               errStreakRef.current = 0;
               setIsPlaying(true);
               setIsLoading(false);
+              syncBackgroundAudio(true);
               const d = e.target.getDuration?.();
               if (d > 0) setDuration(d);
             } else if (e.data === 2) {
+              // Если экран заблокировали, браузер сам шлёт паузу — сразу возобновляем
+              if (document.hidden && shouldBePlayingRef.current) {
+                setTimeout(() => playerRef.current?.playVideo?.(), 150);
+                return;
+              }
               setIsPlaying(false);
               setIsLoading(false);
+              syncBackgroundAudio(false);
             } else if (e.data === 3) {
               setIsLoading(true);
             } else if (e.data === 0) {
@@ -208,6 +264,14 @@ export function useAudioEngine(onEndedOrOptions?: any) {
       }
     }
 
+    const handleVisibility = () => {
+      if (document.hidden && shouldBePlayingRef.current) {
+        setTimeout(() => playerRef.current?.playVideo?.(), 200);
+        setTimeout(() => playerRef.current?.playVideo?.(), 600);
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+
     const timer = setInterval(() => {
       if (readyRef.current && playerRef.current?.getPlayerState?.() === 1) {
         setCurrentTime(playerRef.current.getCurrentTime?.() || 0);
@@ -216,8 +280,11 @@ export function useAudioEngine(onEndedOrOptions?: any) {
       }
     }, 250);
 
-    return () => clearInterval(timer);
-  }, [playNext]);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [playNext, syncBackgroundAudio]);
 
   const playStream = useCallback((input: string | Track, ..._rest: any[]) => {
     if (!input) return;
@@ -246,8 +313,14 @@ export function useAudioEngine(onEndedOrOptions?: any) {
 
   const togglePlay = useCallback((..._args: any[]) => {
     if (!readyRef.current || !playerRef.current) return;
-    isPlaying ? playerRef.current.pauseVideo() : playerRef.current.playVideo();
-  }, [isPlaying]);
+    if (isPlaying) {
+      syncBackgroundAudio(false);
+      playerRef.current.pauseVideo();
+    } else {
+      syncBackgroundAudio(true);
+      playerRef.current.playVideo();
+    }
+  }, [isPlaying, syncBackgroundAudio]);
 
   const seekTo = useCallback((sec: number) => {
     if (!readyRef.current || !playerRef.current) return;
@@ -295,8 +368,15 @@ export function useAudioEngine(onEndedOrOptions?: any) {
     eqGains, activePreset, setBandGain, updateBandGain: setBandGain, setEqGain: setBandGain,
     applyPreset, applyEqPreset: applyPreset, resetEq: (..._args: any[]) => applyPreset('flat'),
     playStream, playTrack,
-    play: (...args: any[]) => (args[0] ? playStream(args[0]) : playerRef.current?.playVideo?.()),
-    pause: (..._args: any[]) => playerRef.current?.pauseVideo?.(),
+    play: (...args: any[]) => {
+      if (args[0]) return playStream(args[0]);
+      syncBackgroundAudio(true);
+      playerRef.current?.playVideo?.();
+    },
+    pause: (..._args: any[]) => {
+      syncBackgroundAudio(false);
+      playerRef.current?.pauseVideo?.();
+    },
     togglePlay, toggle: togglePlay,
     playNext: (..._args: any[]) => playNext(), nextTrack: (..._args: any[]) => playNext(),
     playPrev: (..._args: any[]) => playPrev(), prevTrack: (..._args: any[]) => playPrev(),

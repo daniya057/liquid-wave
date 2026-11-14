@@ -1,22 +1,9 @@
-import type { Metadata, Viewport } from 'next';
+import type { Metadata } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
   title: 'Liquid Wave',
-  description: 'Space Obsidian Music Player',
-  manifest: '/manifest.json',
-  appleWebApp: {
-    capable: true,
-    statusBarStyle: 'black-translucent',
-    title: 'Liquid Wave',
-  },
-};
-
-export const viewport: Viewport = {
-  themeColor: '#09090b',
-  width: 'device-width',
-  initialScale: 1,
-  maximumScale: 1,
+  description: 'Музыкальный плеер',
 };
 
 export default function RootLayout({
@@ -25,8 +12,24 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="ru" className="dark">
-      <body className="bg-[#09090b] text-white antialiased">{children}</body>
+    <html lang="ru">
+      <body>
+        {children}
+        <div
+          id="yt-global-player"
+          aria-hidden="true"
+          style={{
+            position: 'fixed',
+            bottom: 0,
+            right: 0,
+            width: '1px',
+            height: '1px',
+            opacity: 0.01,
+            pointerEvents: 'none',
+            zIndex: -1,
+          }}
+        />
+      </body>
     </html>
   );
 }

@@ -3,9 +3,14 @@ import { NextRequest, NextResponse } from 'next/server';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+const BROWSER_UA =
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1';
+
 interface AudioSource {
   url: string;
   mimeType: string;
+  userAgent: string;
+  provider: 'youtube' | 'soundcloud';
   isHls?: boolean;
 }
 
@@ -135,8 +140,7 @@ async function warmHeadChunk(cacheKey: string, source: AudioSource) {
     const res = await fetch(source.url, {
       headers: {
         Range: 'bytes=0-524287',
-        'User-Agent':
-          'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1',
+        'User-Agent': source.userAgent,
       },
       signal: AbortSignal.timeout(5000),
     });
@@ -162,7 +166,7 @@ async function warmHeadChunk(cacheKey: string, source: AudioSource) {
 
 async function searchYoutubeMusicSongs(query: string) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 4000);
+  const timer = setTimeout(() => controller.abort(), 4500);
   try {
     const res = await fetch('https://music.youtube.com/youtubei/v1/search?prettyPrint=false', {
       method: 'POST',
@@ -279,28 +283,40 @@ async function getSoundCloudClientId(): Promise<string> {
       'User-Agent':
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     },
+    signal: AbortSignal.timeout(5000),
   });
   const html = await pageRes.text();
-  const scriptUrls = [...html.matchAll(/<script[^>]+src="(https:\/\/a-v2\.sndcdn\.com\/assets\/[^"]+\.js)"/g)]
+  const scriptUrls = [
+    ...html.matchAll(/<script[^>]+src="(https:\/\/a-v2\.sndcdn\.com\/assets\/[^"]+\.js)"/g),
+  ]
     .map((m) => m[1])
-    .slice(-6);
+    .reverse()
+    .slice(0, 12);
 
-  for (const scriptUrl of scriptUrls.reverse()) {
-    try {
-      const jsRes = await fetch(scriptUrl);
-      const js = await jsRes.text();
-      const match =
-        js.match(/client_id\s*[:=]\s*["']([a-zA-Z0-9]{32})["']/) ||
-        js.match(/client_id=([a-zA-Z0-9]{32})/);
-      if (match?.[1]) {
-        cachedScClientId = {
-          id: match[1],
-          expiresAt: Date.now() + 1000 * 60 * 60 * 12,
-        };
-        return match[1];
-      }
-    } catch {
-      // проверяем следующий скрипт
+  for (let i = 0; i < scriptUrls.length; i += 4) {
+    const batch = scriptUrls.slice(i, i + 4);
+    const results = await Promise.all(
+      batch.map(async (scriptUrl) => {
+        try {
+          const jsRes = await fetch(scriptUrl, { signal: AbortSignal.timeout(4000) });
+          if (!jsRes.ok) return null;
+          const js = await jsRes.text();
+          const match =
+            js.match(/client_id\s*[:=]\s*["']([a-zA-Z0-9]{32})["']/) ||
+            js.match(/client_id=([a-zA-Z0-9]{32})/);
+          return match?.[1] || null;
+        } catch {
+          return null;
+        }
+      })
+    );
+    const found = results.find(Boolean);
+    if (found) {
+      cachedScClientId = {
+        id: found,
+        expiresAt: Date.now() + 1000 * 60 * 60 * 12,
+      };
+      return found;
     }
   }
 
@@ -321,7 +337,7 @@ async function fetchFromSoundCloudQuery(
   const clientId = await getSoundCloudClientId();
   const cleanQuery = cleanTrackQuery(rawQuery) || rawQuery;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5000);
+  const timer = setTimeout(() => controller.abort(), 6000);
 
   try {
     const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(cleanQuery)}&client_id=${clientId}&limit=15`;
@@ -332,7 +348,10 @@ async function fetchFromSoundCloudQuery(
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       },
     });
-    if (!res.ok) throw new Error('SC search HTTP ' + res.status);
+    if (!res.ok) {
+      if (res.status === 401 || res.status === 403) cachedScClientId = null;
+      throw new Error('SC search HTTP ' + res.status);
+    }
 
     const data = await res.json();
     const items: any[] = Array.isArray(data?.collection) ? data.collection : [];
@@ -341,11 +360,11 @@ async function fetchFromSoundCloudQuery(
       .filter(
         (item) =>
           Array.isArray(item?.media?.transcodings) &&
-          (item.duration || 0) >= 45000 &&
+          (item.duration || 0) >= 35000 &&
           item.policy !== 'BLOCK'
       )
       .map((item) => {
-        let score = 0;
+        let score = 100;
         const durSec = (item.duration || 0) / 1000;
         const titleStr = String(item.title || '');
         const metaBlob = `${titleStr} ${item.tag_list || ''} ${item.user?.username || ''}`;
@@ -359,14 +378,14 @@ async function fetchFromSoundCloudQuery(
           const diff = Math.abs(durSec - expectedDurationSec);
           if (diff <= 4) score += 200;
           else if (diff <= 8) score += 100;
-          else if (diff > 12) score -= 300;
+          else if (diff > 15) score -= 250;
         } else if (durSec > 450) {
           score -= 150;
         }
 
         return { item, score };
       })
-      .filter((entry) => entry.score >= 50)
+      .filter((entry) => entry.score >= 20)
       .sort((a, b) => b.score - a.score)
       .map((entry) => entry.item);
 
@@ -381,7 +400,13 @@ async function fetchFromSoundCloudQuery(
         if (infoRes.ok) {
           const info = await infoRes.json();
           if (info?.url && !info.url.includes('/preview/')) {
-            return { url: info.url, mimeType: 'audio/mpeg', isHls: false };
+            return {
+              url: info.url,
+              mimeType: 'audio/mpeg',
+              userAgent: BROWSER_UA,
+              provider: 'soundcloud',
+              isHls: false,
+            };
           }
         }
       }
@@ -396,13 +421,19 @@ async function fetchFromSoundCloudQuery(
         if (infoRes.ok) {
           const info = await infoRes.json();
           if (info?.url && !info.url.includes('/preview/')) {
-            return { url: info.url, mimeType: 'application/vnd.apple.mpegurl', isHls: true };
+            return {
+              url: info.url,
+              mimeType: 'application/vnd.apple.mpegurl',
+              userAgent: BROWSER_UA,
+              provider: 'soundcloud',
+              isHls: true,
+            };
           }
         }
       }
     }
 
-    throw new Error('No verified original stream on SoundCloud');
+    throw new Error('No playable stream on SoundCloud');
   } finally {
     clearTimeout(timer);
   }
@@ -411,7 +442,7 @@ async function fetchFromSoundCloudQuery(
 async function fetchYoutubeTitleOEmbed(videoId: string): Promise<string> {
   const res = await fetch(
     `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
-    { signal: AbortSignal.timeout(3500) }
+    { signal: AbortSignal.timeout(4000) }
   );
   if (!res.ok) throw new Error('oEmbed failed');
   const data = await res.json();
@@ -431,7 +462,7 @@ async function fetchInnerTubeMp4(
   extraClient: Record<string, any> = {}
 ): Promise<AudioSource> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3800);
+  const timer = setTimeout(() => controller.abort(), 4000);
   try {
     const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
       method: 'POST',
@@ -457,6 +488,11 @@ async function fetchInnerTubeMp4(
     });
     if (!res.ok) throw new Error('InnerTube HTTP ' + res.status);
     const data = await res.json();
+
+    if (data?.playabilityStatus?.status && data.playabilityStatus.status !== 'OK') {
+      throw new Error('Playability: ' + data.playabilityStatus.status);
+    }
+
     const formats = [
       ...(data?.streamingData?.adaptiveFormats || []),
       ...(data?.streamingData?.formats || []),
@@ -475,6 +511,8 @@ async function fetchInnerTubeMp4(
     return {
       url: mp4Audio[0].url,
       mimeType: 'audio/mp4',
+      userAgent: ua,
+      provider: 'youtube',
       isHls: false,
     };
   } finally {
@@ -482,11 +520,35 @@ async function fetchInnerTubeMp4(
   }
 }
 
-async function getAudioSource(rawId: string, expectedDurationSec = 0): Promise<AudioSource> {
+async function resolveFallbackSoundCloud(
+  rawId: string,
+  expectedDurationSec = 0
+): Promise<AudioSource> {
+  if (rawId.startsWith('ytq:')) {
+    const query = safeDecode(rawId.split(':').slice(2).join(':')).trim();
+    return fetchFromSoundCloudQuery(query, expectedDurationSec);
+  }
+  const titleQuery = await fetchYoutubeTitleOEmbed(rawId);
+  return fetchFromSoundCloudQuery(titleQuery, expectedDurationSec);
+}
+
+async function getAudioSource(
+  rawId: string,
+  expectedDurationSec = 0,
+  skipYoutube = false
+): Promise<AudioSource> {
   const cacheKey = `${rawId}:${expectedDurationSec}`;
-  const cached = streamUrlCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    return { url: cached.url, mimeType: cached.mimeType, isHls: cached.isHls };
+  if (!skipYoutube) {
+    const cached = streamUrlCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return {
+        url: cached.url,
+        mimeType: cached.mimeType,
+        userAgent: cached.userAgent,
+        provider: cached.provider,
+        isHls: cached.isHls,
+      };
+    }
   }
 
   let videoId: string | null = rawId;
@@ -495,21 +557,14 @@ async function getAudioSource(rawId: string, expectedDurationSec = 0): Promise<A
   if (rawId.startsWith('ytq:')) {
     query = safeDecode(rawId.split(':').slice(2).join(':')).trim();
     if (!query) throw new Error('Empty track query');
-    videoId = await resolveYtqToVideoId(query, expectedDurationSec);
+    videoId = skipYoutube ? null : await resolveYtqToVideoId(query, expectedDurationSec);
   }
 
   let resolved: AudioSource;
 
-  if (videoId) {
+  if (videoId && !skipYoutube) {
     try {
       resolved = await Promise.any([
-        fetchInnerTubeMp4(
-          videoId,
-          'IOS',
-          '19.45.4',
-          'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
-          { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' }
-        ),
         fetchInnerTubeMp4(
           videoId,
           'ANDROID_VR',
@@ -523,19 +578,25 @@ async function getAudioSource(rawId: string, expectedDurationSec = 0): Promise<A
             androidSdkVersion: 32,
           }
         ),
+        fetchInnerTubeMp4(
+          videoId,
+          'IOS',
+          '19.45.4',
+          'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
+          { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' }
+        ),
       ]);
     } catch {
       const q = query || (await fetchYoutubeTitleOEmbed(videoId));
       resolved = await fetchFromSoundCloudQuery(q, expectedDurationSec);
     }
   } else {
-    resolved = await fetchFromSoundCloudQuery(query, expectedDurationSec);
+    const q = query || (await fetchYoutubeTitleOEmbed(rawId));
+    resolved = await fetchFromSoundCloudQuery(q, expectedDurationSec);
   }
 
   streamUrlCache.set(cacheKey, {
-    url: resolved.url,
-    mimeType: resolved.mimeType,
-    isHls: resolved.isHls,
+    ...resolved,
     expiresAt: Date.now() + 1000 * 60 * 60,
   });
 
@@ -638,7 +699,7 @@ async function handleStream(
       return NextResponse.json({ videoId });
     }
 
-    const source = await getAudioSource(rawId, expectedDurationSec);
+    let source = await getAudioSource(rawId, expectedDurationSec);
 
     if (req.nextUrl.searchParams.get('prefetch') === '1') {
       await warmHeadChunk(cacheKey, source);
@@ -659,7 +720,7 @@ async function handleStream(
         const end = Number(match[2]);
         if (start === 0 && end < cachedHead.bytes.byteLength) {
           const slice = cachedHead.bytes.slice(0, end + 1);
-          return new NextResponse(slice, {
+          return new NextResponse(Buffer.from(slice), {
             status: 206,
             headers: {
               'Content-Type': cachedHead.contentType,
@@ -673,30 +734,43 @@ async function handleStream(
       }
     }
 
-    const upstreamHeaders: Record<string, string> = {
-      'User-Agent':
-        'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1',
+    const fetchUpstream = async (src: AudioSource) => {
+      const headers: Record<string, string> = {
+        'User-Agent': src.userAgent,
+      };
+      if (rangeHeader) {
+        headers['Range'] = rangeHeader;
+      }
+      return fetch(src.url, {
+        method: isHead ? 'HEAD' : 'GET',
+        headers,
+      });
     };
-    if (rangeHeader) {
-      upstreamHeaders['Range'] = rangeHeader;
-    }
 
-    let upstream = await fetch(source.url, {
-      method: isHead ? 'HEAD' : 'GET',
-      headers: upstreamHeaders,
-    });
+    let upstream = await fetchUpstream(source);
 
-    if (upstream.status === 403 || upstream.status === 410) {
+    // Если YouTube отклонил поток (403/410), сразу переключаемся на SoundCloud и кэшируем рабочий источник
+    if (!upstream.ok && upstream.status !== 206) {
       streamUrlCache.delete(cacheKey);
       headChunkCache.delete(cacheKey);
-      const fresh = await getAudioSource(rawId, expectedDurationSec);
-      if (fresh.isHls) {
-        return handleHlsStream(req, fresh.url, isHead);
+
+      if (source.provider === 'youtube') {
+        source = await resolveFallbackSoundCloud(rawId, expectedDurationSec);
+        streamUrlCache.set(cacheKey, {
+          ...source,
+          expiresAt: Date.now() + 1000 * 60 * 60,
+        });
+        if (source.isHls) {
+          return handleHlsStream(req, source.url, isHead);
+        }
+        upstream = await fetchUpstream(source);
+      } else {
+        source = await getAudioSource(rawId, expectedDurationSec, true);
+        if (source.isHls) {
+          return handleHlsStream(req, source.url, isHead);
+        }
+        upstream = await fetchUpstream(source);
       }
-      upstream = await fetch(fresh.url, {
-        method: isHead ? 'HEAD' : 'GET',
-        headers: upstreamHeaders,
-      });
     }
 
     if (!upstream.ok && upstream.status !== 206) {

@@ -112,7 +112,6 @@ function scoreYoutubeCandidate(
 
   let score = 0;
 
-  // Автогенерируемые студийные треки YouTube Music ("Artist - Topic") — точный оригинал со Spotify
   if (channelLower.endsWith('- topic') || snippetLower.includes('provided to youtube')) {
     score += 170;
   } else if (channelLower.includes('vevo') || channelLower.includes('official')) {
@@ -123,7 +122,6 @@ function scoreYoutubeCandidate(
     score += 45;
   }
 
-  // Жёсткий штраф за ремиксы, концерты, каверы и замедленные версии
   for (const mod of UNWANTED_MODIFIERS) {
     if (!queryLower.includes(mod)) {
       if (titleLower.includes(mod)) {
@@ -134,7 +132,6 @@ function scoreYoutubeCandidate(
     }
   }
 
-  // Проверка адекватной длительности трека (45 сек – 10 мин)
   if (video.durationSec > 0) {
     if (video.durationSec < 45 || video.durationSec > 600) {
       score -= 150;
@@ -143,7 +140,6 @@ function scoreYoutubeCandidate(
     }
   }
 
-  // Совпадение слов артиста и названия песни
   const queryTokens = queryLower
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .split(/\s+/)
@@ -220,7 +216,6 @@ async function resolveYtqToOfficialVideoId(rawQuery: string): Promise<string> {
     return cached.videoId;
   }
 
-  // Параллельно ищем точное совпадение и студийную topic-версию
   const [directList, topicList] = await Promise.all([
     searchYoutubeCandidates(cleanQuery),
     searchYoutubeCandidates(`${cleanQuery} topic`),
@@ -326,7 +321,7 @@ async function getSoundCloudClientId(): Promise<string> {
         return match[1];
       }
     } catch {
-      // проверяем следующий скрипт
+      // игнорируем
     }
   }
 
@@ -588,7 +583,6 @@ async function getAudioSource(rawId: string): Promise<AudioSource> {
     videoId = await resolveYtqToOfficialVideoId(fallbackQuery);
   }
 
-  // Сначала забираем точный оригинальный поток YouTube (даём ему 4.5 сек приоритета)
   const ytPromise = fetchExactYoutubeStream(videoId);
   const scPromise = (async () => {
     const q = fallbackQuery || (await fetchYoutubeTitleOEmbed(videoId));

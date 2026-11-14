@@ -152,7 +152,6 @@ export default function HomePage() {
       // игнорируем
     }
 
-    // Загружаем актуальные подсказки заранее
     fetch('/api/search?mode=suggestions')
       .then((r) => r.json())
       .then((d) => {
@@ -163,7 +162,6 @@ export default function HomePage() {
       .catch(() => {});
   }, []);
 
-  // Закрытие выпадающих подсказок при клике вне поиска
   useEffect(() => {
     const onDocClick = (e: MouseEvent) => {
       if (searchBoxRef.current && !searchBoxRef.current.contains(e.target as Node)) {
@@ -174,7 +172,6 @@ export default function HomePage() {
     return () => document.removeEventListener('mousedown', onDocClick);
   }, []);
 
-  // Живые подсказки при вводе букв
   useEffect(() => {
     const q = searchQuery.trim();
     const timer = setTimeout(() => {
@@ -303,7 +300,10 @@ export default function HomePage() {
           return;
         }
       }
-      await playStream(track);
+
+      const durParam =
+        track.duration && track.duration > 0 ? `?d=${Math.round(track.duration)}` : '';
+      await playStream(`/api/stream/${encodeURIComponent(track.id)}${durParam}`);
     },
     [queue, isShuffled, prefetchTrack, isSaved, getOfflineUrl, playStream]
   );
@@ -312,7 +312,7 @@ export default function HomePage() {
     playTrackRef.current = playTrack;
   }, [playTrack]);
 
-  // Поддержка экрана блокировки iPhone и наушников (Media Session API)
+  // Поддержка экрана блокировки iPhone/Android и наушников (Media Session API)
   useEffect(() => {
     if (!currentTrack || typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
 
@@ -325,11 +325,22 @@ export default function HomePage() {
         : [],
     });
 
+    navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+
     navigator.mediaSession.setActionHandler('play', () => togglePlay());
     navigator.mediaSession.setActionHandler('pause', () => pause());
     navigator.mediaSession.setActionHandler('previoustrack', () => handlePrevTrack());
     navigator.mediaSession.setActionHandler('nexttrack', () => handleNextTrack());
-  }, [currentTrack, togglePlay, pause, handlePrevTrack, handleNextTrack]);
+    try {
+      navigator.mediaSession.setActionHandler('seekto', (details) => {
+        if (typeof details.seekTime === 'number') {
+          seek(details.seekTime);
+        }
+      });
+    } catch {
+      // игнорируем на старых браузерах
+    }
+  }, [currentTrack, isPlaying, togglePlay, pause, handlePrevTrack, handleNextTrack, seek]);
 
   const toggleShuffle = useCallback(() => {
     setIsShuffled((prev) => {
@@ -443,7 +454,7 @@ export default function HomePage() {
     }
   };
 
-  const openArtist = async (artist: Artist & { browseId?: string }) => {
+  const openArtist = async (artist: Artist & { browseId?: string; subscribers?: string }) => {
     setSection('explore');
     setIsSearchFocused(false);
     setArtistTab('all');
@@ -930,7 +941,7 @@ export default function HomePage() {
                     </div>
                   ) : (
                     <>
-                      {/* Блок альбомов и синглов артиста (показывается отдельно во вкладках "Всё" и "Альбомы") */}
+                      {/* Блок альбомов и синглов артиста */}
                       {collectionView.type === 'artist' &&
                         (artistTab === 'all' || artistTab === 'albums') &&
                         collectionView.albums &&
@@ -1026,7 +1037,6 @@ export default function HomePage() {
                         </p>
                       </div>
 
-                      {/* Чипы быстрых подсказок прямо на пустом экране */}
                       <div className="flex flex-wrap items-center justify-center gap-2 max-w-2xl mx-auto">
                         {suggestions.slice(0, 10).map((tag) => (
                           <button

@@ -9,13 +9,23 @@ interface AudioSource {
   isHls?: boolean;
 }
 
+interface CachedHeadChunk {
+  bytes: Uint8Array;
+  contentType: string;
+  totalSize: number;
+  expiresAt: number;
+}
+
 const streamUrlCache = new Map<string, AudioSource & { expiresAt: number }>();
+const headChunkCache = new Map<string, CachedHeadChunk>();
 const resolvedVideoIdCache = new Map<string, { videoId: string; expiresAt: number }>();
 let cachedScClientId: { id: string; expiresAt: number } | null = null;
 
 const UNWANTED_MODIFIERS = [
   'remix',
   'rmx',
+  'edit',
+  'vip',
   'flip',
   'bootleg',
   'mashup',
@@ -65,11 +75,11 @@ function safeDecode(value: string): string {
 function cleanTrackQuery(raw: string): string {
   return raw
     .replace(
-      /\((?:official\vert{}music\vert{}lyric\vert{}lyrics\vert{}audio\vert{}video\vert{}visualizer\vert{}hd\vert{}hq\vert{}4k\vert{}8k\vert{}explicit\vert{}clean\vert{}клип\vert{}премьера\vert{}текст\vert{}аудио\vert{}видео)[^)]*\)/gi,
+      /\((?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|клип|премьера|текст|аудио|видео)[^)]*\)/gi,
       ''
     )
     .replace(
-      /\[(?:official\vert{}music\vert{}lyric\vert{}lyrics\vert{}audio\vert{}video\vert{}visualizer\vert{}hd\vert{}hq\vert{}4k\vert{}8k\vert{}explicit\vert{}clean\vert{}клип\vert{}премьера\vert{}текст\vert{}аудио\vert{}видео)[^\]]*\]/gi,
+      /\[(?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|клип|премьера|текст|аудио|видео)[^\]]*\]/gi,
       ''
     )
     .replace(/\s{2,}/g, ' ')
@@ -89,6 +99,64 @@ function hasUnwantedVariant(text: string, allowedQuery: string): boolean {
   const qLower = allowedQuery.toLowerCase();
   const tLower = text.toLowerCase();
   return UNWANTED_MODIFIERS.some((mod) => !qLower.includes(mod) && tLower.includes(mod));
+}
+
+function hasSuspiciousBrackets(title: string, allowedQuery: string): boolean {
+  const qLower = allowedQuery.toLowerCase();
+  const brackets = title.match(/[\(\[][^\)\]]+[\)\]]/g) || [];
+  for (const b of brackets) {
+    const inner = b.slice(1, -1).trim().toLowerCase();
+    if (!inner) continue;
+    const isSafe = /^(official(\s+(audio|video|music\s+video))?|audio|video|lyrics?|lyric\s+video|explicit|clean|remastered(\s+\d{4})?|hd|hq|feat\.?.*|ft\.?.*)$/i.test(
+      inner
+    );
+    if (!isSafe && !qLower.includes(inner)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function setHeadChunkCache(key: string, entry: CachedHeadChunk) {
+  if (headChunkCache.size >= 10) {
+    const oldestKey = headChunkCache.keys().next().value;
+    if (oldestKey) headChunkCache.delete(oldestKey);
+  }
+  headChunkCache.set(key, entry);
+}
+
+async function warmHeadChunk(cacheKey: string, source: AudioSource) {
+  if (source.isHls) return;
+  const existing = headChunkCache.get(cacheKey);
+  if (existing && existing.expiresAt > Date.now()) return;
+
+  try {
+    const res = await fetch(source.url, {
+      headers: {
+        Range: 'bytes=0-524287',
+        'User-Agent':
+          'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1',
+      },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok && res.status !== 206) return;
+
+    const ab = await res.arrayBuffer();
+    if (ab.byteLength === 0) return;
+
+    const contentRange = res.headers.get('content-range') || '';
+    const totalMatch = contentRange.match(/\/(\d+)$/);
+    const totalSize = totalMatch ? Number(totalMatch[1]) : ab.byteLength;
+
+    setHeadChunkCache(cacheKey, {
+      bytes: new Uint8Array(ab),
+      contentType: res.headers.get('content-type') || source.mimeType,
+      totalSize,
+      expiresAt: Date.now() + 1000 * 60 * 30,
+    });
+  } catch {
+    // игнорируем ошибки фонового прогрева
+  }
 }
 
 async function searchYoutubeMusicSongs(query: string) {
@@ -176,13 +244,15 @@ async function resolveYtqToVideoId(rawQuery: string, expectedDurationSec = 0): P
 
   const ranked = songs
     .map((item) => {
-      let score = 100;
-      if (hasUnwantedVariant(`${item.title} ${item.channel}`, cleanQuery)) score -= 300;
+      let score = 150;
+      if (hasUnwantedVariant(`${item.title} ${item.channel}`, cleanQuery)) score -= 400;
+      if (hasSuspiciousBrackets(item.title, cleanQuery)) score -= 220;
+
       if (expectedDurationSec > 0 && item.durationSec > 0) {
         const diff = Math.abs(item.durationSec - expectedDurationSec);
-        if (diff <= 4) score += 200;
-        else if (diff <= 8) score += 100;
-        else if (diff > 15) score -= 250;
+        if (diff <= 4) score += 220;
+        else if (diff <= 8) score += 110;
+        else if (diff > 15) score -= 300;
       }
       return { item, score };
     })
@@ -276,23 +346,26 @@ async function fetchFromSoundCloudQuery(
       .map((item) => {
         let score = 0;
         const durSec = (item.duration || 0) / 1000;
-        const metaBlob = `${item.title || ''} ${item.tag_list || ''} ${item.user?.username || ''}`;
+        const titleStr = String(item.title || '');
+        const metaBlob = `${titleStr} ${item.tag_list || ''} ${item.user?.username || ''}`;
 
-        if (hasUnwantedVariant(metaBlob, cleanQuery)) score -= 250;
-        if (item.publisher_metadata?.isrc || item.publisher_metadata?.release_title) score += 120;
-        if (item.user?.verified) score += 60;
+        if (hasUnwantedVariant(metaBlob, cleanQuery)) score -= 400;
+        if (hasSuspiciousBrackets(titleStr, cleanQuery)) score -= 220;
+        if (item.publisher_metadata?.isrc || item.publisher_metadata?.release_title) score += 160;
+        if (item.user?.verified) score += 90;
 
         if (expectedDurationSec > 0) {
           const diff = Math.abs(durSec - expectedDurationSec);
-          if (diff <= 4) score += 180;
-          else if (diff <= 8) score += 90;
-          else if (diff > 15) score -= 200;
-        } else if (durSec > 480) {
-          score -= 100;
+          if (diff <= 4) score += 200;
+          else if (diff <= 8) score += 100;
+          else if (diff > 12) score -= 300;
+        } else if (durSec > 450) {
+          score -= 150;
         }
 
         return { item, score };
       })
+      .filter((entry) => entry.score >= 50)
       .sort((a, b) => b.score - a.score)
       .map((entry) => entry.item);
 
@@ -324,7 +397,7 @@ async function fetchFromSoundCloudQuery(
       }
     }
 
-    throw new Error('No full-length stream on SoundCloud');
+    throw new Error('No verified original stream on SoundCloud');
   } finally {
     clearTimeout(timer);
   }
@@ -351,7 +424,7 @@ async function fetchInnerTubeMp4(
   extraClient: Record<string, any> = {}
 ): Promise<AudioSource> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 4000);
+  const timer = setTimeout(() => controller.abort(), 3800);
   try {
     const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
       method: 'POST',
@@ -418,36 +491,34 @@ async function getAudioSource(rawId: string, expectedDurationSec = 0): Promise<A
     videoId = await resolveYtqToVideoId(query, expectedDurationSec);
   }
 
-  const tasks: Promise<AudioSource>[] = [];
+  let resolved: AudioSource;
 
+  // Сначала всегда пытаемся получить официальный студийный трек с YouTube, и только при неудаче идём в SoundCloud
   if (videoId) {
-    tasks.push(
-      fetchInnerTubeMp4(
-        videoId,
-        'IOS',
-        '19.45.4',
-        'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
-        { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' }
-      ),
-      fetchInnerTubeMp4(
-        videoId,
-        'ANDROID_VR',
-        '1.60.19',
-        'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
-        { deviceMake: 'Oculus', deviceModel: 'Quest 3', osName: 'Android', osVersion: '12L', androidSdkVersion: 32 }
-      )
-    );
+    try {
+      resolved = await Promise.any([
+        fetchInnerTubeMp4(
+          videoId,
+          'IOS',
+          '19.45.4',
+          'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
+          { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' }
+        ),
+        fetchInnerTubeMp4(
+          videoId,
+          'ANDROID_VR',
+          '1.60.19',
+          'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+          { deviceMake: 'Oculus', deviceModel: 'Quest 3', osName: 'Android', osVersion: '12L', androidSdkVersion: 32 }
+        ),
+      ]);
+    } catch {
+      const q = query || (await fetchYoutubeTitleOEmbed(videoId));
+      resolved = await fetchFromSoundCloudQuery(q, expectedDurationSec);
+    }
+  } else {
+    resolved = await fetchFromSoundCloudQuery(query, expectedDurationSec);
   }
-
-  tasks.push(
-    (async () => {
-      const q = query || (videoId ? await fetchYoutubeTitleOEmbed(videoId) : '');
-      if (!q) throw new Error('No query for SoundCloud');
-      return fetchFromSoundCloudQuery(q, expectedDurationSec);
-    })()
-  );
-
-  const resolved = await Promise.any(tasks);
 
   streamUrlCache.set(cacheKey, {
     url: resolved.url,
@@ -474,7 +545,7 @@ async function handleHlsStream(req: NextRequest, m3u8Url: string, isHead: boolea
       status: 200,
       headers: {
         'Content-Type': 'application/vnd.apple.mpegurl',
-        'Cache-Control': 'no-store',
+        'Cache-Control': 'private, max-age=1800',
       },
     });
   }
@@ -493,7 +564,7 @@ async function handleHlsStream(req: NextRequest, m3u8Url: string, isHead: boolea
       status: 200,
       headers: {
         'Content-Type': 'audio/mpeg',
-        'Cache-Control': 'no-store',
+        'Cache-Control': 'private, max-age=1800',
       },
     });
   }
@@ -525,7 +596,7 @@ async function handleHlsStream(req: NextRequest, m3u8Url: string, isHead: boolea
     status: 200,
     headers: {
       'Content-Type': 'audio/mpeg',
-      'Cache-Control': 'no-store',
+      'Cache-Control': 'private, max-age=1800',
     },
   });
 }
@@ -543,6 +614,7 @@ async function handleStream(
     }
 
     const expectedDurationSec = Number(req.nextUrl.searchParams.get('d') || '0') || 0;
+    const cacheKey = `${rawId}:${expectedDurationSec}`;
 
     if (req.nextUrl.searchParams.get('resolve') === '1') {
       const videoId = rawId.startsWith('ytq:')
@@ -557,6 +629,7 @@ async function handleStream(
     const source = await getAudioSource(rawId, expectedDurationSec);
 
     if (req.nextUrl.searchParams.get('prefetch') === '1') {
+      await warmHeadChunk(cacheKey, source);
       return NextResponse.json({ ok: true });
     }
 
@@ -565,6 +638,30 @@ async function handleStream(
     }
 
     const rangeHeader = req.headers.get('range');
+    const cachedHead = headChunkCache.get(cacheKey);
+
+    // Мгновенно отдаём начальные байты из RAM, если трек был предзагружен
+    if (!isHead && rangeHeader && cachedHead && cachedHead.expiresAt > Date.now()) {
+      const match = rangeHeader.match(/^bytes=(\d+)-(\d+)$/);
+      if (match) {
+        const start = Number(match[1]);
+        const end = Number(match[2]);
+        if (start === 0 && end < cachedHead.bytes.byteLength) {
+          const slice = cachedHead.bytes.slice(0, end + 1);
+          return new NextResponse(slice, {
+            status: 206,
+            headers: {
+              'Content-Type': cachedHead.contentType,
+              'Accept-Ranges': 'bytes',
+              'Content-Length': String(slice.byteLength),
+              'Content-Range': `bytes 0-${end}/${cachedHead.totalSize}`,
+              'Cache-Control': 'private, max-age=1800',
+            },
+          });
+        }
+      }
+    }
+
     const upstreamHeaders: Record<string, string> = {
       'User-Agent':
         'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1',
@@ -579,7 +676,8 @@ async function handleStream(
     });
 
     if (upstream.status === 403 || upstream.status === 410) {
-      streamUrlCache.delete(`${rawId}:${expectedDurationSec}`);
+      streamUrlCache.delete(cacheKey);
+      headChunkCache.delete(cacheKey);
       const fresh = await getAudioSource(rawId, expectedDurationSec);
       if (fresh.isHls) {
         return handleHlsStream(req, fresh.url, isHead);
@@ -597,7 +695,7 @@ async function handleStream(
     const responseHeaders = new Headers();
     responseHeaders.set('Content-Type', upstream.headers.get('content-type') || source.mimeType);
     responseHeaders.set('Accept-Ranges', 'bytes');
-    responseHeaders.set('Cache-Control', 'no-store');
+    responseHeaders.set('Cache-Control', 'private, max-age=1800');
 
     const contentLength = upstream.headers.get('content-length');
     if (contentLength) responseHeaders.set('Content-Length', contentLength);

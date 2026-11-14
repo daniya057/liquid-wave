@@ -28,7 +28,23 @@ import {
   ArrowLeft,
   ListPlus,
   Link2,
+  Clock,
+  TrendingUp,
+  X,
 } from 'lucide-react';
+
+const INITIAL_SUGGESTIONS = [
+  'Miyagi & Эндшпиль',
+  'Скриптонит',
+  'Три дня дождя',
+  'MACAN',
+  'The Weeknd',
+  'Billie Eilish',
+  'Phonk',
+  'Инди-рок',
+  'Synthwave',
+  'Lo-Fi для учёбы',
+];
 
 function formatDuration(sec: number): string {
   if (!sec || !isFinite(sec)) return '';
@@ -66,7 +82,7 @@ export default function HomePage() {
   const [selectedPlaylistId, setSelectedPlaylistId] = useState<string | null>(null);
   const [selectedMood, setSelectedMood] = useState<MoodType>('all');
 
-  // Глобальный поиск
+  // Глобальный поиск и подсказки
   const [searchQuery, setSearchQuery] = useState('');
   const [searchTab, setSearchTab] = useState<'all' | 'tracks' | 'albums' | 'artists'>('all');
   const [foundTracks, setFoundTracks] = useState<Track[]>([]);
@@ -74,14 +90,20 @@ export default function HomePage() {
   const [foundArtists, setFoundArtists] = useState<Artist[]>([]);
   const [isSearching, setIsSearching] = useState(false);
 
+  const [isSearchFocused, setIsSearchFocused] = useState(false);
+  const [recentSearches, setRecentSearches] = useState<string[]>([]);
+  const [suggestions, setSuggestions] = useState<string[]>(INITIAL_SUGGESTIONS);
+  const searchBoxRef = useRef<HTMLDivElement | null>(null);
+
   // Просмотр альбома или артиста
+  const [artistTab, setArtistTab] = useState<'all' | 'tracks' | 'albums'>('all');
   const [collectionView, setCollectionView] = useState<{
     type: 'album' | 'artist';
     title: string;
     subtitle?: string;
     thumbnail?: string;
     tracks: Track[];
-    albums?: Album[];
+    albums?: (Album & { year?: string; type?: string })[];
     loading: boolean;
   } | null>(null);
 
@@ -124,18 +146,94 @@ export default function HomePage() {
     try {
       const raw = localStorage.getItem('lw-liked-tracks');
       if (raw) setLikedTracks(JSON.parse(raw));
+      const rawHistory = localStorage.getItem('lw-recent-searches');
+      if (rawHistory) setRecentSearches(JSON.parse(rawHistory));
     } catch {
       // игнорируем
     }
+
+    // Загружаем актуальные подсказки заранее
+    fetch('/api/search?mode=suggestions')
+      .then((r) => r.json())
+      .then((d) => {
+        if (Array.isArray(d?.suggestions) && d.suggestions.length > 0) {
+          setSuggestions(d.suggestions);
+        }
+      })
+      .catch(() => {});
   }, []);
+
+  // Закрытие выпадающих подсказок при клике вне поиска
+  useEffect(() => {
+    const onDocClick = (e: MouseEvent) => {
+      if (searchBoxRef.current && !searchBoxRef.current.contains(e.target as Node)) {
+        setIsSearchFocused(false);
+      }
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, []);
+
+  // Живые подсказки при вводе букв
+  useEffect(() => {
+    const q = searchQuery.trim();
+    const timer = setTimeout(() => {
+      const url = q
+        ? `/api/search?mode=suggestions&q=${encodeURIComponent(q)}`
+        : '/api/search?mode=suggestions';
+      fetch(url)
+        .then((r) => r.json())
+        .then((d) => {
+          if (Array.isArray(d?.suggestions) && d.suggestions.length > 0) {
+            setSuggestions(d.suggestions);
+          }
+        })
+        .catch(() => {});
+    }, 180);
+
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
+
+  const saveRecentSearch = (term: string) => {
+    const clean = term.trim();
+    if (!clean) return;
+    setRecentSearches((prev) => {
+      const next = [clean, ...prev.filter((item) => item.toLowerCase() !== clean.toLowerCase())].slice(
+        0,
+        6
+      );
+      try {
+        localStorage.setItem('lw-recent-searches', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  };
+
+  const removeRecentSearch = (term: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setRecentSearches((prev) => {
+      const next = prev.filter((item) => item !== term);
+      try {
+        localStorage.setItem('lw-recent-searches', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  };
 
   const prefetchTrack = useCallback(
     (track?: Track) => {
       if (!track || isSaved(track.id) || prefetchedIdsRef.current.has(track.id)) return;
       prefetchedIdsRef.current.add(track.id);
-      fetch(`/api/stream/${track.id}?prefetch=1`).catch(() => {
-        prefetchedIdsRef.current.delete(track.id);
-      });
+      const durParam = track.duration && track.duration > 0 ? `&d=${Math.round(track.duration)}` : '';
+      const url = `/api/stream/${encodeURIComponent(track.id)}`;
+      fetch(`${url}?prefetch=1${durParam}`)
+        .then(() => {
+          fetch(url, { headers: { Range: 'bytes=0-1' } }).catch(() => {});
+          fetch(url, { headers: { Range: 'bytes=0-262143' } }).catch(() => {});
+        })
+        .catch(() => {
+          prefetchedIdsRef.current.delete(track.id);
+        });
     },
     [isSaved]
   );
@@ -205,7 +303,7 @@ export default function HomePage() {
           return;
         }
       }
-      await playStream(`/api/stream/${track.id}`);
+      await playStream(track);
     },
     [queue, isShuffled, prefetchTrack, isSaved, getOfflineUrl, playStream]
   );
@@ -233,7 +331,6 @@ export default function HomePage() {
     navigator.mediaSession.setActionHandler('nexttrack', () => handleNextTrack());
   }, [currentTrack, togglePlay, pause, handlePrevTrack, handleNextTrack]);
 
-  // Переключение режима перемешивания (Shuffle)
   const toggleShuffle = useCallback(() => {
     setIsShuffled((prev) => {
       const next = !prev;
@@ -253,7 +350,6 @@ export default function HomePage() {
     });
   }, [originalQueue, queue, currentTrack, prefetchTrack]);
 
-  // Запуск любого списка сразу вперемешку
   const playShuffledList = (list: Track[]) => {
     if (list.length === 0) return;
     const shuffled = shuffleTracks(list);
@@ -276,14 +372,17 @@ export default function HomePage() {
     cancelTimer: cancelSleep,
   } = useSleepTimer(pause, volume, setVolume);
 
-  const handleSearch = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!searchQuery.trim()) return;
+  const executeSearch = async (rawQuery: string) => {
+    const clean = rawQuery.trim();
+    if (!clean) return;
+    setSearchQuery(clean);
+    setIsSearchFocused(false);
+    saveRecentSearch(clean);
     setSection('explore');
     setCollectionView(null);
     setIsSearching(true);
     try {
-      const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery.trim())}`);
+      const res = await fetch(`/api/search?q=${encodeURIComponent(clean)}`);
       const data = await res.json();
       setFoundTracks(data.tracks || []);
       setFoundAlbums(data.albums || []);
@@ -294,7 +393,11 @@ export default function HomePage() {
     }
   };
 
-  // Поиск треков прямо внутри открытого плейлиста
+  const handleSearch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await executeSearch(searchQuery);
+  };
+
   const handleInPlaylistSearch = async (e?: React.FormEvent) => {
     e?.preventDefault();
     if (!inPlaylistQuery.trim()) return;
@@ -310,6 +413,7 @@ export default function HomePage() {
 
   const openAlbum = async (album: Album) => {
     setSection('explore');
+    setIsSearchFocused(false);
     setCollectionView({
       type: 'album',
       title: album.title,
@@ -322,15 +426,27 @@ export default function HomePage() {
       const res = await fetch(`/api/search?listId=${encodeURIComponent(album.id)}`);
       const data = await res.json();
       setCollectionView((prev) =>
-        prev ? { ...prev, tracks: data.tracks || [], loading: false } : null
+        prev
+          ? {
+              ...prev,
+              title: data.title || prev.title,
+              subtitle: data.artist || prev.subtitle,
+              thumbnail: data.thumbnail || prev.thumbnail,
+              tracks: data.tracks || [],
+              loading: false,
+            }
+          : null
       );
+      if (data.tracks?.[0]) prefetchTrack(data.tracks[0]);
     } catch {
       setCollectionView((prev) => (prev ? { ...prev, loading: false } : null));
     }
   };
 
-  const openArtist = async (artist: Artist) => {
+  const openArtist = async (artist: Artist & { browseId?: string }) => {
     setSection('explore');
+    setIsSearchFocused(false);
+    setArtistTab('all');
     setCollectionView({
       type: 'artist',
       title: artist.name,
@@ -341,18 +457,22 @@ export default function HomePage() {
       loading: true,
     });
     try {
-      const res = await fetch(`/api/search?artist=${encodeURIComponent(artist.name)}`);
+      const queryParam = artist.browseId || artist.id?.startsWith('UC') ? artist.id : artist.name;
+      const res = await fetch(`/api/search?artist=${encodeURIComponent(queryParam)}`);
       const data = await res.json();
       setCollectionView((prev) =>
         prev
           ? {
               ...prev,
+              title: data.artist?.name || prev.title,
+              thumbnail: data.artist?.thumbnail || prev.thumbnail,
               tracks: data.tracks || [],
               albums: data.albums || [],
               loading: false,
             }
           : null
       );
+      if (data.tracks?.[0]) prefetchTrack(data.tracks[0]);
     } catch {
       setCollectionView((prev) => (prev ? { ...prev, loading: false } : null));
     }
@@ -380,7 +500,6 @@ export default function HomePage() {
     }
   };
 
-  // Импорт плейлиста из Spotify / YouTube Music / YouTube / SoundCloud
   const handleImportPlaylist = async (e?: React.FormEvent) => {
     e?.preventDefault();
     if (!importUrl.trim() || isImporting) return;
@@ -459,7 +578,16 @@ export default function HomePage() {
             <p className={`text-sm font-medium truncate ${active ? 'text-teal-300' : 'text-white'}`}>
               {track.title}
             </p>
-            <p className="text-xs text-white/50 truncate">{track.artist}</p>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                openArtist({ id: track.artist, name: track.artist, thumbnail: track.thumbnail });
+              }}
+              className="text-xs text-white/50 hover:text-teal-300 truncate block text-left transition cursor-pointer"
+            >
+              {track.artist}
+            </button>
           </div>
         </div>
 
@@ -614,23 +742,89 @@ export default function HomePage() {
               <Radio className="w-4 h-4 text-white" />
             </div>
 
-            <form onSubmit={handleSearch} className="relative flex-1">
-              <Search className="w-4 h-4 text-white/40 absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Треки, альбомы, артисты или ссылка YouTube..."
-                className="w-full pl-11 pr-24 py-3 rounded-2xl bg-white/[0.05] border border-white/10 text-sm text-white placeholder:text-white/35 focus:outline-none focus:border-teal-400/50 transition"
-              />
-              <button
-                type="submit"
-                disabled={isSearching}
-                className="absolute right-2 top-1/2 -translate-y-1/2 px-4 py-1.5 rounded-xl bg-white/12 hover:bg-white/20 text-xs font-medium text-white transition cursor-pointer"
-              >
-                {isSearching ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Найти'}
-              </button>
-            </form>
+            <div ref={searchBoxRef} className="relative flex-1">
+              <form onSubmit={handleSearch} className="relative">
+                <Search className="w-4 h-4 text-white/40 absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onFocus={() => setIsSearchFocused(true)}
+                  onChange={(e) => {
+                    setSearchQuery(e.target.value);
+                    setIsSearchFocused(true);
+                  }}
+                  placeholder="Треки, альбомы, артисты..."
+                  className="w-full pl-11 pr-28 py-3 rounded-2xl bg-white/[0.05] border border-white/10 text-sm text-white placeholder:text-white/35 focus:outline-none focus:border-teal-400/50 transition"
+                />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSearchQuery('');
+                      setIsSearchFocused(true);
+                    }}
+                    className="absolute right-20 top-1/2 -translate-y-1/2 p-1 text-white/40 hover:text-white cursor-pointer"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                )}
+                <button
+                  type="submit"
+                  disabled={isSearching}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 px-4 py-1.5 rounded-xl bg-white/12 hover:bg-white/20 text-xs font-medium text-white transition cursor-pointer"
+                >
+                  {isSearching ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Найти'}
+                </button>
+              </form>
+
+              {/* ВЫПАДАЮЩИЕ ПОДСКАЗКИ ДО ВВОДА И ВО ВРЕМЯ ВВОДА */}
+              {isSearchFocused && (
+                <div className="absolute left-0 right-0 mt-2 rounded-2xl bg-[#121218]/98 backdrop-blur-2xl border border-white/15 shadow-2xl overflow-hidden z-40">
+                  {!searchQuery.trim() && recentSearches.length > 0 && (
+                    <div className="p-2 border-b border-white/10">
+                      <span className="text-[10px] uppercase tracking-wider text-white/40 px-3 py-1 block">
+                        Недавние запросы
+                      </span>
+                      {recentSearches.map((item) => (
+                        <div
+                          key={`recent-${item}`}
+                          onClick={() => executeSearch(item)}
+                          className="flex items-center justify-between px-3 py-2 rounded-xl hover:bg-white/[0.08] text-xs text-white/85 cursor-pointer transition"
+                        >
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <Clock className="w-3.5 h-3.5 text-white/40 shrink-0" />
+                            <span className="truncate">{item}</span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={(e) => removeRecentSearch(item, e)}
+                            className="p-1 text-white/35 hover:text-white cursor-pointer"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="p-2">
+                    <span className="text-[10px] uppercase tracking-wider text-white/40 px-3 py-1 block">
+                      {searchQuery.trim() ? 'Подсказки' : 'Популярное сейчас'}
+                    </span>
+                    {suggestions.slice(0, 8).map((sug) => (
+                      <div
+                        key={`sug-${sug}`}
+                        onClick={() => executeSearch(sug)}
+                        className="flex items-center gap-2.5 px-3 py-2 rounded-xl hover:bg-white/[0.08] text-xs text-white/90 cursor-pointer transition"
+                      >
+                        <TrendingUp className="w-3.5 h-3.5 text-teal-300 shrink-0" />
+                        <span className="truncate">{sug}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
         </div>
 
@@ -703,53 +897,98 @@ export default function HomePage() {
                     </div>
                   </div>
 
+                  {/* Вкладки у исполнителя: Всё / Все песни / Альбомы и релизы */}
+                  {collectionView.type === 'artist' && !collectionView.loading && (
+                    <div className="flex items-center gap-2 overflow-x-auto pb-1">
+                      {[
+                        { id: 'all', label: 'Всё' },
+                        { id: 'tracks', label: `Все песни (${collectionView.tracks.length})` },
+                        {
+                          id: 'albums',
+                          label: `Альбомы и синглы (${collectionView.albums?.length || 0})`,
+                        },
+                      ].map((tab) => (
+                        <button
+                          key={tab.id}
+                          onClick={() => setArtistTab(tab.id as typeof artistTab)}
+                          className={`px-4 py-2 rounded-full text-xs font-medium border transition shrink-0 cursor-pointer ${
+                            artistTab === tab.id
+                              ? 'bg-white text-zinc-950 border-white'
+                              : 'bg-white/[0.04] border-white/10 text-white/70 hover:text-white'
+                          }`}
+                        >
+                          {tab.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
                   {collectionView.loading ? (
                     <div className="flex items-center justify-center py-16 text-white/50 gap-2">
                       <Loader2 className="w-5 h-5 animate-spin text-teal-400" />
-                      <span>Загружаю треки...</span>
+                      <span>Загружаю каталог...</span>
                     </div>
                   ) : (
                     <>
-                      {collectionView.tracks.length > 0 && (
-                        <div className="space-y-2">
-                          <h2 className="text-base font-semibold text-white mb-3">Треки</h2>
-                          {collectionView.tracks.map((t, i) =>
-                            renderTrackRow(t, collectionView.tracks, i)
-                          )}
-                        </div>
-                      )}
-
-                      {collectionView.albums && collectionView.albums.length > 0 && (
-                        <div className="space-y-3 pt-4">
-                          <h2 className="text-base font-semibold text-white">Альбомы и релизы</h2>
-                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-                            {collectionView.albums.map((alb) => (
-                              <div
-                                key={alb.id}
-                                onClick={() => openAlbum(alb)}
-                                className="p-3 rounded-2xl bg-white/[0.03] hover:bg-white/[0.08] border border-white/10 transition cursor-pointer"
-                              >
-                                <div className="aspect-square rounded-xl overflow-hidden bg-white/10 mb-2.5">
-                                  {alb.thumbnail && (
-                                    // eslint-disable-next-line @next/next/no-img-element
-                                    <img
-                                      src={alb.thumbnail}
-                                      alt=""
-                                      className="w-full h-full object-cover"
-                                    />
-                                  )}
+                      {/* Блок альбомов и синглов артиста (показывается отдельно во вкладках "Всё" и "Альбомы") */}
+                      {collectionView.type === 'artist' &&
+                        (artistTab === 'all' || artistTab === 'albums') &&
+                        collectionView.albums &&
+                        collectionView.albums.length > 0 && (
+                          <div className="space-y-3">
+                            <h2 className="text-base font-semibold text-white">
+                              Альбомы и релизы ({collectionView.albums.length})
+                            </h2>
+                            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                              {(artistTab === 'all'
+                                ? collectionView.albums.slice(0, 8)
+                                : collectionView.albums
+                              ).map((alb) => (
+                                <div
+                                  key={alb.id}
+                                  onClick={() => openAlbum(alb)}
+                                  className="group p-3 rounded-2xl bg-white/[0.03] hover:bg-white/[0.08] border border-white/10 transition cursor-pointer"
+                                >
+                                  <div className="aspect-square rounded-xl overflow-hidden bg-white/10 mb-2.5 flex items-center justify-center">
+                                    {alb.thumbnail ? (
+                                      // eslint-disable-next-line @next/next/no-img-element
+                                      <img
+                                        src={alb.thumbnail}
+                                        alt=""
+                                        className="w-full h-full object-cover group-hover:scale-105 transition duration-300"
+                                      />
+                                    ) : (
+                                      <Disc className="w-10 h-10 text-white/30" />
+                                    )}
+                                  </div>
+                                  <p className="text-xs font-semibold text-white truncate">
+                                    {alb.title}
+                                  </p>
+                                  <p className="text-[11px] text-white/50 truncate mt-0.5">
+                                    {[alb.type, alb.year].filter(Boolean).join(' • ') || alb.artist}
+                                  </p>
                                 </div>
-                                <p className="text-xs font-semibold text-white truncate">
-                                  {alb.title}
-                                </p>
-                                <p className="text-[11px] text-white/50 truncate mt-0.5">
-                                  {alb.artist}
-                                </p>
-                              </div>
-                            ))}
+                              ))}
+                            </div>
                           </div>
-                        </div>
-                      )}
+                        )}
+
+                      {/* Блок всех песен артиста или треклист альбома */}
+                      {(collectionView.type === 'album' ||
+                        artistTab === 'all' ||
+                        artistTab === 'tracks') &&
+                        collectionView.tracks.length > 0 && (
+                          <div className="space-y-2">
+                            <h2 className="text-base font-semibold text-white mb-3">
+                              {collectionView.type === 'artist'
+                                ? `Все песни (${collectionView.tracks.length})`
+                                : `Треки (${collectionView.tracks.length})`}
+                            </h2>
+                            {collectionView.tracks.map((t, i) =>
+                              renderTrackRow(t, collectionView.tracks, i)
+                            )}
+                          </div>
+                        )}
                     </>
                   )}
                 </div>
@@ -779,14 +1018,27 @@ export default function HomePage() {
                   {foundTracks.length === 0 &&
                   foundAlbums.length === 0 &&
                   foundArtists.length === 0 ? (
-                    <div className="text-center py-20 rounded-3xl bg-white/[0.02] border border-white/[0.07] px-4">
-                      <Search className="w-10 h-10 text-white/20 mx-auto mb-3" />
-                      <p className="text-sm text-white/70 font-medium">
-                        Введи имя артиста, название песни или альбома
-                      </p>
-                      <p className="text-xs text-white/40 mt-1">
-                        Например: Nirvana, Daft Punk, Кино или Miyagi
-                      </p>
+                    <div className="text-center py-14 rounded-3xl bg-white/[0.02] border border-white/[0.07] px-4 space-y-5">
+                      <div>
+                        <Search className="w-10 h-10 text-white/20 mx-auto mb-3" />
+                        <p className="text-sm text-white/80 font-medium">
+                          Выбери подсказку или введи имя артиста, песню или альбом
+                        </p>
+                      </div>
+
+                      {/* Чипы быстрых подсказок прямо на пустом экране */}
+                      <div className="flex flex-wrap items-center justify-center gap-2 max-w-2xl mx-auto">
+                        {suggestions.slice(0, 10).map((tag) => (
+                          <button
+                            key={`chip-${tag}`}
+                            type="button"
+                            onClick={() => executeSearch(tag)}
+                            className="px-3.5 py-2 rounded-full bg-white/[0.05] hover:bg-teal-500/20 border border-white/10 hover:border-teal-400/40 text-xs text-white/80 hover:text-teal-200 transition cursor-pointer"
+                          >
+                            {tag}
+                          </button>
+                        ))}
+                      </div>
                     </div>
                   ) : (
                     <div className="space-y-8">
@@ -868,7 +1120,7 @@ export default function HomePage() {
                         foundTracks.length > 0 && (
                           <section className="space-y-2.5">
                             <h2 className="text-base font-semibold text-white">Треки</h2>
-                            {(searchTab === 'all' ? foundTracks.slice(0, 10) : foundTracks).map(
+                            {(searchTab === 'all' ? foundTracks.slice(0, 12) : foundTracks).map(
                               (track, i) => renderTrackRow(track, foundTracks, i)
                             )}
                           </section>
@@ -896,7 +1148,6 @@ export default function HomePage() {
                     <span>Ко всем плейлистам</span>
                   </button>
 
-                  {/* Шапка плейлиста */}
                   <div className="flex flex-col sm:flex-row items-center justify-between gap-4 p-6 rounded-3xl bg-gradient-to-r from-violet-600/20 to-teal-500/20 border border-white/15">
                     <div className="flex items-center gap-4">
                       <div className="w-20 h-20 rounded-2xl overflow-hidden bg-white/10 flex items-center justify-center shrink-0">
@@ -961,14 +1212,12 @@ export default function HomePage() {
                     </div>
                   </div>
 
-                  {/* Фильтр по настроению */}
                   <MoodFilterBar
                     tracks={activePlaylist.tracks}
                     selectedMood={selectedMood}
                     onSelectMood={handleMoodChange}
                   />
 
-                  {/* Список треков в плейлисте */}
                   {visiblePlaylistTracks.length > 0 && (
                     <div className="space-y-2">
                       {visiblePlaylistTracks.map((t, i) =>
@@ -977,7 +1226,6 @@ export default function HomePage() {
                     </div>
                   )}
 
-                  {/* УДОБНОЕ ДОБАВЛЕНИЕ ПЕСЕН ПРЯМО ВНУТРИ ПЛЕЙЛИСТА */}
                   <div className="p-5 rounded-3xl bg-white/[0.03] border border-white/10 space-y-4">
                     <div>
                       <h2 className="text-sm font-semibold text-white">
@@ -1013,11 +1261,10 @@ export default function HomePage() {
                       </button>
                     </form>
 
-                    {/* Показываем результаты поиска или быстрый выбор из Избранного */}
                     {(() => {
-                      const suggestions =
+                      const listSuggestions =
                         inPlaylistResults.length > 0 ? inPlaylistResults : likedTracks.slice(0, 8);
-                      if (suggestions.length === 0) return null;
+                      if (listSuggestions.length === 0) return null;
 
                       return (
                         <div className="space-y-2 pt-1">
@@ -1026,7 +1273,7 @@ export default function HomePage() {
                               ? 'Результаты поиска'
                               : 'Быстро добавить из Избранного'}
                           </span>
-                          {suggestions.map((track) => {
+                          {listSuggestions.map((track) => {
                             const alreadyIn = activePlaylist.tracks.some((t) => t.id === track.id);
                             return (
                               <div
@@ -1034,7 +1281,7 @@ export default function HomePage() {
                                 className="flex items-center justify-between gap-3 p-2.5 rounded-2xl bg-white/[0.025] border border-white/[0.07]"
                               >
                                 <div
-                                  onClick={() => playTrack(track, suggestions)}
+                                  onClick={() => playTrack(track, listSuggestions)}
                                   className="flex items-center gap-3 min-w-0 flex-1 cursor-pointer"
                                 >
                                   <div className="w-10 h-10 rounded-xl overflow-hidden bg-white/10 shrink-0">
@@ -1110,7 +1357,6 @@ export default function HomePage() {
                     </form>
                   </div>
 
-                  {/* ИМПОРТ ПЛЕЙЛИСТА ИЗ SPOTIFY / YOUTUBE MUSIC / YOUTUBE / SOUNDCLOUD */}
                   <div className="p-4 sm:p-5 rounded-3xl bg-white/[0.03] border border-white/10 space-y-3">
                     <div className="flex items-center gap-2">
                       <Link2 className="w-4 h-4 text-teal-300 shrink-0" />
@@ -1148,9 +1394,7 @@ export default function HomePage() {
                       </button>
                     </form>
 
-                    {importError && (
-                      <p className="text-xs text-rose-400">{importError}</p>
-                    )}
+                    {importError && <p className="text-xs text-rose-400">{importError}</p>}
                   </div>
 
                   {playlists.length === 0 ? (

@@ -25,6 +25,28 @@ function getYtDlpPath(): string {
   return 'yt-dlp';
 }
 
+// Автоматически переводит JSON-куки из расширений браузера в формат Netscape для yt-dlp
+function convertJsonToNetscape(jsonStr: string): string {
+  const parsed = JSON.parse(jsonStr);
+  const list = Array.isArray(parsed) ? parsed : parsed.cookies || [];
+  const lines = ['# Netscape HTTP Cookie File'];
+
+  for (const c of list) {
+    if (!c.domain || !c.name) continue;
+    const domain = String(c.domain);
+    const includeSubdomains = domain.startsWith('.') ? 'TRUE' : 'FALSE';
+    const cookiePath = c.path || '/';
+    const secure = c.secure ? 'TRUE' : 'FALSE';
+    const expiry = c.expirationDate ? Math.floor(Number(c.expirationDate)) : 0;
+    const name = String(c.name);
+    const value = String(c.value ?? '');
+
+    lines.push(`${domain}\t${includeSubdomains}\t${cookiePath}\t${secure}\t${expiry}\t${name}\t${value}`);
+  }
+
+  return lines.join('\n') + '\n';
+}
+
 function getCookiesFilePath(): string | null {
   const raw = process.env.YOUTUBE_COOKIES?.trim();
   if (!raw) {
@@ -34,14 +56,22 @@ function getCookiesFilePath(): string | null {
 
   const tmpPath = path.join('/tmp', 'yt_cookies.txt');
   try {
-    const content = raw.startsWith('#')
-      ? raw
-      : Buffer.from(raw, 'base64').toString('utf-8');
+    let content =
+      raw.startsWith('#') || raw.startsWith('[') || raw.startsWith('{')
+        ? raw
+        : Buffer.from(raw, 'base64').toString('utf-8');
+
+    content = content.trim();
+
+    // Если куки в формате JSON — конвертируем в Netscape
+    if (content.startsWith('[') || content.startsWith('{')) {
+      content = convertJsonToNetscape(content);
+    }
 
     fs.writeFileSync(tmpPath, content, 'utf-8');
     return tmpPath;
   } catch (e) {
-    console.error('[STREAM] Ошибка записи куки:', e);
+    console.error('[STREAM] Ошибка обработки куки:', e);
     return null;
   }
 }
@@ -161,71 +191,4 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const startTime = Date.now();
-  const resolvedParams = await params;
-  const id =
-    resolvedParams?.id ||
-    request.nextUrl.pathname.split('/').filter(Boolean).pop();
-
-  if (!id || id === 'undefined' || id === 'stream' || id === 'search') {
-    return NextResponse.json({ error: 'Неверный ID трека' }, { status: 400 });
-  }
-
-  if (request.nextUrl.searchParams.get('prefetch') === '1') {
-    try {
-      await getDirectAudioUrl(id);
-      console.log(`[STREAM] Prefetch готов для ${id} (${Date.now() - startTime}ms)`);
-      return NextResponse.json({ ok: true });
-    } catch {
-      return NextResponse.json({ ok: false }, { status: 502 });
-    }
-  }
-
-  try {
-    const isCached = urlCache.has(id);
-    const audioUrl = await getDirectAudioUrl(id);
-    const rangeHeader = request.headers.get('range');
-
-    const fetchHeaders: HeadersInit = {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    };
-    if (rangeHeader) {
-      fetchHeaders['Range'] = rangeHeader;
-    }
-
-    const audioRes = await fetch(audioUrl, { headers: fetchHeaders });
-
-    if (!audioRes.ok && audioRes.status !== 206) {
-      urlCache.delete(id);
-      return NextResponse.json({ error: 'Поток временно недоступен' }, { status: 502 });
-    }
-
-    const headers = new Headers();
-    headers.set('Content-Type', audioRes.headers.get('content-type') || 'audio/mp4');
-    headers.set('Access-Control-Allow-Origin', '*');
-    headers.set('Accept-Ranges', 'bytes');
-    headers.set('Cache-Control', 'public, max-age=3600');
-
-    const contentLength = audioRes.headers.get('content-length');
-    if (contentLength) headers.set('Content-Length', contentLength);
-
-    const contentRange = audioRes.headers.get('content-range');
-    if (contentRange) headers.set('Content-Range', contentRange);
-
-    if (!rangeHeader || rangeHeader.startsWith('bytes=0-')) {
-      console.log(
-        `[STREAM] Старт воспроизведения ${id} (кэш: ${isCached ? 'да' : 'нет'}) за ${Date.now() - startTime}ms`
-      );
-    }
-
-    return new NextResponse(audioRes.body, {
-      status: audioRes.status,
-      headers,
-    });
-  } catch (err) {
-    console.error(`[STREAM] Не удалось запустить ${id}:`, err);
-    urlCache.delete(id);
-    return NextResponse.json({ error: 'Ошибка загрузки аудиопотока' }, { status: 502 });
-  }
-}
+  const start

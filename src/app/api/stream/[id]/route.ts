@@ -23,12 +23,15 @@ interface CachedBuffer {
 
 const streamUrlCache = new Map<string, AudioSource & { expiresAt: number }>();
 const fullAudioBufferCache = new Map<string, CachedBuffer>();
+const inFlightSourcePromises = new Map<string, Promise<AudioSource>>();
+const inFlightBufferPromises = new Map<string, Promise<CachedBuffer>>();
 const ytmLookupCache = new Map<
   string,
   { videoId: string; durationSec: number; title: string; artist: string; expiresAt: number }
 >();
 const durationLookupCache = new Map<string, { durationSec: number; expiresAt: number }>();
 let cachedScClientId: { id: string; expiresAt: number } | null = null;
+let ytBlockedUntil = 0;
 
 const UNWANTED_MODIFIERS = [
   'remix',
@@ -138,6 +141,9 @@ const DESCRIPTION_BANNED_RE =
 const BENIGN_BRACKET_RE =
   /^(?:\d{4}|official|official\s+audio|official\s+video|official\s+music\s+video|music\s+video|lyric|lyrics|lyric\s+video|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|original|original\s+mix|album\s+version|single\s+version|full|full\s+song|full\s+track|remaster(?:ed)?(?:\s+\d{4})?|from\s+.+|feat\.?\s+.+|ft\.?\s+.+|with\s+.+|prod\.?\s+.+|клип|премьера|текст|аудио|видео|официальный|оригинал)$/i;
 
+const DASH_RELEASE_TAG_RE =
+  /\s+-\s+(?:\d{4}\s+)?(?:remaster(?:ed)?(?:\s+\d{4})?|original\s+mix|album\s+version|single\s+version|radio\s+edit|explicit|clean|bonus\s+track|deluxe(?:\s+edition)?|anniversary(?:\s+edition)?|mono|stereo)\b.*$/i;
+
 const NOISE_WORDS = new Set([
   'feat',
   'ft',
@@ -154,6 +160,10 @@ const NOISE_WORDS = new Set([
   'clean',
   'remastered',
   'remaster',
+  'deluxe',
+  'edition',
+  'anniversary',
+  'bonus',
   'original',
   'version',
   'full',
@@ -222,12 +232,12 @@ function safeDecode(value: string): string {
 }
 
 function extractMainArtist(artist: string): string {
-  // Не режем по "&", чтобы не ломать дуэты вроде "Miyagi & Эндшпиль" или "Simon & Garfunkel"
   return artist.split(/\s+(?:feat\.?|ft\.?|featuring)\s+|,\s*/i)[0].trim();
 }
 
 function stripFeaturingAndTags(raw: string): string {
   return raw
+    .replace(DASH_RELEASE_TAG_RE, '')
     .replace(/\((?:feat\.?|ft\.?|with|prod\.?)\s+[^)]+\)/gi, '')
     .replace(/\[(?:feat\.?|ft\.?|with|prod\.?)\s+[^\]]+\]/gi, '')
     .replace(/\s+(?:feat\.?|ft\.?)\s+.+$/i, '')
@@ -245,12 +255,13 @@ function stripFeaturingAndTags(raw: string): string {
 
 function cleanTrackQuery(raw: string): string {
   return raw
+    .replace(DASH_RELEASE_TAG_RE, '')
     .replace(
-      /\((?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|original(?:\s+mix)?|remaster(?:ed)?(?:\s+\d{4})?|клип|премьера|текст|аудио|видео)[^)]*\)/gi,
+      /\((?:\d{4}|official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|original(?:\s+mix)?|remaster(?:ed)?(?:\s+\d{4})?|клип|премьера|текст|аудио|видео)[^)]*\)/gi,
       ''
     )
     .replace(
-      /\[(?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|original(?:\s+mix)?|remaster(?:ed)?(?:\s+\d{4})?|клип|премьера|текст|аудио|видео)[^\]]*\]/gi,
+      /\[(?:\d{4}|official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|original(?:\s+mix)?|remaster(?:ed)?(?:\s+\d{4})?|клип|премьера|текст|аудио|видео)[^\]]*\]/gi,
       ''
     )
     .replace(/\s{2,}/g, ' ')
@@ -320,16 +331,13 @@ function hasSuspiciousParenthetical(candidateTitle: string, allowedContext: stri
 }
 
 function setBufferCache(key: string, entry: CachedBuffer) {
-  if (fullAudioBufferCache.size >= 16) {
+  if (fullAudioBufferCache.size >= 24) {
     const oldestKey = fullAudioBufferCache.keys().next().value;
     if (oldestKey) fullAudioBufferCache.delete(oldestKey);
   }
   fullAudioBufferCache.set(key, entry);
 }
 
-/**
- * Узнаёт точную студийную длительность оригинала одновременно из Deezer, iTunes и LRCLIB
- */
 async function lookupReferenceDurationSec(title: string, artist: string): Promise<number> {
   const cleanT = stripFeaturingAndTags(title);
   const primaryA = extractMainArtist(artist);
@@ -361,12 +369,11 @@ async function lookupReferenceDurationSec(title: string, artist: string): Promis
   const term = `${primaryA} ${cleanT}`.trim();
 
   const [deezerDur, itunesDur, lrclibDur] = await Promise.all([
-    // 1. Deezer Public API (огромная база с точной длительностью до секунды)
     (async () => {
       try {
         const res = await fetch(
           `https://api.deezer.com/search?q=${encodeURIComponent(term)}&limit=6`,
-          { signal: AbortSignal.timeout(2500) }
+          { signal: AbortSignal.timeout(2000) }
         );
         if (!res.ok) return 0;
         const data = await res.json();
@@ -384,12 +391,11 @@ async function lookupReferenceDurationSec(title: string, artist: string): Promis
       }
     })(),
 
-    // 2. iTunes Search API
     (async () => {
       try {
         const res = await fetch(
           `https://itunes.apple.com/search?term=${encodeURIComponent(term)}&media=music&entity=song&limit=6`,
-          { signal: AbortSignal.timeout(2500) }
+          { signal: AbortSignal.timeout(2000) }
         );
         if (!res.ok) return 0;
         const data = await res.json();
@@ -407,11 +413,10 @@ async function lookupReferenceDurationSec(title: string, artist: string): Promis
       }
     })(),
 
-    // 3. LRCLIB
     (async () => {
       try {
         const url = `https://lrclib.net/api/search?track_name=${encodeURIComponent(cleanT)}&artist_name=${encodeURIComponent(primaryA)}`;
-        const res = await fetch(url, { signal: AbortSignal.timeout(2500) });
+        const res = await fetch(url, { signal: AbortSignal.timeout(2000) });
         if (!res.ok) return 0;
         const list = await res.json();
         if (!Array.isArray(list)) return 0;
@@ -450,6 +455,7 @@ function scoreCandidateMatch(params: {
   fallbackQuery: string;
   expectedDurationSec: number;
   maxDurationToleranceSec?: number;
+  maxExtraWords?: number;
 }): number {
   const {
     candidateTitle,
@@ -462,6 +468,7 @@ function scoreCandidateMatch(params: {
     fallbackQuery,
     expectedDurationSec,
     maxDurationToleranceSec,
+    maxExtraWords = 1,
   } = params;
 
   const allowedContext = `${targetArtist} ${targetTitle} ${fallbackQuery}`.trim();
@@ -472,7 +479,7 @@ function scoreCandidateMatch(params: {
     return -10000;
   }
 
-  // 2. Проверяем описание трека (часто пишут "my guitar cover / remix" только в описании)
+  // 2. Проверяем описание трека
   if (
     candidateDescription &&
     !hasUnwantedVariant(allowedContext, '') &&
@@ -497,7 +504,7 @@ function scoreCandidateMatch(params: {
   if (candidateDurationSec > 0) {
     if (expectedDurationSec > 0) {
       const tolerance =
-        maxDurationToleranceSec ?? Math.max(6, Math.min(10, Math.round(expectedDurationSec * 0.03)));
+        maxDurationToleranceSec ?? Math.max(8, Math.min(14, Math.round(expectedDurationSec * 0.04)));
       if (Math.abs(candidateDurationSec - expectedDurationSec) > tolerance) {
         return -10000;
       }
@@ -539,7 +546,7 @@ function scoreCandidateMatch(params: {
     }
   }
 
-  if (unexplainedExtraWords >= 2) {
+  if (unexplainedExtraWords > maxExtraWords) {
     return -10000;
   }
 
@@ -547,7 +554,7 @@ function scoreCandidateMatch(params: {
   if (unexplainedExtraWords === 0) {
     score += 220;
   } else {
-    score -= 130;
+    score -= unexplainedExtraWords * 90;
   }
 
   // 6. Проверка присутствия артиста в метаданных ИЛИ заголовке ("Artist - Title")
@@ -565,7 +572,7 @@ function scoreCandidateMatch(params: {
         const exactDurationMatch =
           expectedDurationSec > 0 &&
           candidateDurationSec > 0 &&
-          Math.abs(candidateDurationSec - expectedDurationSec) <= 2;
+          Math.abs(candidateDurationSec - expectedDurationSec) <= 3;
         if (!exactDurationMatch || titleRatio < 1.0 || unexplainedExtraWords > 0) {
           return -10000;
         }
@@ -578,8 +585,8 @@ function scoreCandidateMatch(params: {
   if (expectedDurationSec > 0 && candidateDurationSec > 0) {
     const diff = Math.abs(candidateDurationSec - expectedDurationSec);
     if (diff <= 2) score += 300;
-    else if (diff <= 4) score += 200;
-    else if (diff <= 6) score += 100;
+    else if (diff <= 5) score += 200;
+    else if (diff <= 10) score += 100;
   }
 
   return score;
@@ -605,7 +612,7 @@ async function searchYoutubeMusicSong(
   try {
     const res = await fetch('https://music.youtube.com/youtubei/v1/search?prettyPrint=false', {
       method: 'POST',
-      signal: AbortSignal.timeout(3500),
+      signal: AbortSignal.timeout(2500),
       headers: {
         'Content-Type': 'application/json',
         'User-Agent': BROWSER_UA,
@@ -699,7 +706,7 @@ async function fetchInnerTubeMp4(
 ): Promise<AudioSource> {
   const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
     method: 'POST',
-    signal: AbortSignal.timeout(2200),
+    signal: AbortSignal.timeout(1800),
     headers: {
       'Content-Type': 'application/json',
       'User-Agent': ua,
@@ -746,7 +753,7 @@ async function fetchInnerTubeMp4(
   const probe = await fetch(mp4Audio[0].url, {
     method: 'GET',
     headers: { Range: 'bytes=0-1023', 'User-Agent': ua },
-    signal: AbortSignal.timeout(1800),
+    signal: AbortSignal.timeout(1500),
   });
   if (!probe.ok && probe.status !== 206) throw new Error('YouTube stream blocked');
 
@@ -760,31 +767,40 @@ async function fetchInnerTubeMp4(
 }
 
 async function tryYoutubeDirect(videoId: string): Promise<AudioSource> {
-  return Promise.any([
-    fetchInnerTubeMp4(videoId, 'WEB_EMBEDDED_PLAYER', '1.20260101.00.00', BROWSER_UA, {
-      thirdParty: { embedUrl: 'https://www.youtube.com/' },
-    }),
-    fetchInnerTubeMp4(
-      videoId,
-      'ANDROID_VR',
-      '1.60.19',
-      'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
-      {
-        deviceMake: 'Oculus',
-        deviceModel: 'Quest 3',
-        osName: 'Android',
-        osVersion: '12L',
-        androidSdkVersion: 32,
-      }
-    ),
-    fetchInnerTubeMp4(
-      videoId,
-      'IOS',
-      '19.45.4',
-      'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
-      { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' }
-    ),
-  ]);
+  if (ytBlockedUntil > Date.now()) {
+    throw new Error('YouTube temporarily bypassed');
+  }
+  try {
+    return await Promise.any([
+      fetchInnerTubeMp4(videoId, 'WEB_EMBEDDED_PLAYER', '1.20260101.00.00', BROWSER_UA, {
+        thirdParty: { embedUrl: 'https://www.youtube.com/' },
+      }),
+      fetchInnerTubeMp4(
+        videoId,
+        'ANDROID_VR',
+        '1.60.19',
+        'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+        {
+          deviceMake: 'Oculus',
+          deviceModel: 'Quest 3',
+          osName: 'Android',
+          osVersion: '12L',
+          androidSdkVersion: 32,
+        }
+      ),
+      fetchInnerTubeMp4(
+        videoId,
+        'IOS',
+        '19.45.4',
+        'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
+        { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83' }
+      ),
+    ]);
+  } catch (err) {
+    // На Render IP YouTube заблокирован — не тратим 2 секунды на каждый следующий трек
+    ytBlockedUntil = Date.now() + 1000 * 60 * 10;
+    throw err;
+  }
 }
 
 async function getSoundCloudClientId(): Promise<string> {
@@ -795,7 +811,7 @@ async function getSoundCloudClientId(): Promise<string> {
   try {
     const pageRes = await fetch('https://soundcloud.com', {
       headers: { 'User-Agent': BROWSER_UA },
-      signal: AbortSignal.timeout(4000),
+      signal: AbortSignal.timeout(3500),
     });
     const html = await pageRes.text();
     const scriptUrls = [
@@ -810,7 +826,7 @@ async function getSoundCloudClientId(): Promise<string> {
       const results = await Promise.all(
         batch.map(async (scriptUrl) => {
           try {
-            const jsRes = await fetch(scriptUrl, { signal: AbortSignal.timeout(3000) });
+            const jsRes = await fetch(scriptUrl, { signal: AbortSignal.timeout(2500) });
             if (!jsRes.ok) return null;
             const js = await jsRes.text();
             const match =
@@ -848,7 +864,7 @@ function isSafariCompatibleTranscoding(t: any): boolean {
 async function searchSoundCloudRaw(query: string, clientId: string): Promise<any[]> {
   const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=45`;
   const res = await fetch(searchUrl, {
-    signal: AbortSignal.timeout(4500),
+    signal: AbortSignal.timeout(3500),
     headers: { 'User-Agent': BROWSER_UA },
   });
   if (!res.ok) {
@@ -869,7 +885,7 @@ async function fetchOfficialArtistTracksOnSoundCloud(
   try {
     const userSearchUrl = `https://api-v2.soundcloud.com/search/users?q=${encodeURIComponent(cleanArtist)}&client_id=${clientId}&limit=5`;
     const res = await fetch(userSearchUrl, {
-      signal: AbortSignal.timeout(3000),
+      signal: AbortSignal.timeout(2500),
       headers: { 'User-Agent': BROWSER_UA },
     });
     if (!res.ok) return [];
@@ -896,7 +912,7 @@ async function fetchOfficialArtistTracksOnSoundCloud(
     const tracksRes = await fetch(
       `https://api-v2.soundcloud.com/users/${topUser.id}/tracks?client_id=${clientId}&limit=50`,
       {
-        signal: AbortSignal.timeout(3500),
+        signal: AbortSignal.timeout(2500),
         headers: { 'User-Agent': BROWSER_UA },
       }
     );
@@ -912,10 +928,10 @@ async function buildHlsAudioBuffer(
   m3u8Url: string,
   expectedDurationSec: number,
   hintMimeType: string
-): Promise<{ bytes: Uint8Array; contentType: string }> {
+): Promise<CachedBuffer> {
   const m3u8Res = await fetch(m3u8Url, {
     headers: { 'User-Agent': BROWSER_UA },
-    signal: AbortSignal.timeout(4500),
+    signal: AbortSignal.timeout(3500),
   });
   if (!m3u8Res.ok) {
     throw new Error('Failed to load HLS playlist');
@@ -988,13 +1004,14 @@ async function buildHlsAudioBuffer(
   const chunks: Uint8Array[] = [];
   let totalBytes = 0;
 
-  for (let i = 0; i < allParts.length; i += 10) {
-    const batch = allParts.slice(i, i + 10);
+  // Скачиваем пачками по 20 сегментов параллельно для мгновенной сборки
+  for (let i = 0; i < allParts.length; i += 20) {
+    const batch = allParts.slice(i, i + 20);
     const buffers = await Promise.all(
       batch.map(async (part) => {
         const headers: Record<string, string> = { 'User-Agent': BROWSER_UA };
         if (part.range) headers['Range'] = part.range;
-        const r = await fetch(part.url, { headers, signal: AbortSignal.timeout(5000) });
+        const r = await fetch(part.url, { headers, signal: AbortSignal.timeout(4500) });
         if (!r.ok && r.status !== 206) throw new Error('HLS segment failed ' + r.status);
         return new Uint8Array(await r.arrayBuffer());
       })
@@ -1026,6 +1043,7 @@ async function buildHlsAudioBuffer(
   return {
     bytes: merged,
     contentType: isMp4 ? 'audio/mp4' : 'audio/mpeg',
+    expiresAt: Date.now() + 1000 * 60 * 30,
   };
 }
 
@@ -1037,17 +1055,17 @@ async function fetchFromSoundCloudQuery(
   cacheKey: string
 ): Promise<AudioSource> {
   const clientId = await getSoundCloudClientId();
-  const cleanQuery = cleanTrackQuery(rawQuery) || rawQuery;
 
   const strippedTitle = stripFeaturingAndTags(targetTitle);
   const primaryArtist = extractMainArtist(targetArtist);
-  const altQuery = `${primaryArtist} ${strippedTitle}`.trim();
+  const primaryQuery = strippedTitle
+    ? `${primaryArtist} ${strippedTitle}`.trim()
+    : cleanTrackQuery(rawQuery) || rawQuery;
 
-  const [searchItems, artistCatalogItems, altItems] = await Promise.all([
-    searchSoundCloudRaw(cleanQuery, clientId),
-    primaryArtist ? fetchOfficialArtistTracksOnSoundCloud(primaryArtist, clientId) : Promise.resolve([]),
-    altQuery && altQuery.toLowerCase() !== cleanQuery.toLowerCase()
-      ? searchSoundCloudRaw(altQuery, clientId).catch(() => [])
+  const [searchItems, artistCatalogItems] = await Promise.all([
+    searchSoundCloudRaw(primaryQuery, clientId),
+    primaryArtist
+      ? fetchOfficialArtistTracksOnSoundCloud(primaryArtist, clientId)
       : Promise.resolve([]),
   ]);
 
@@ -1058,7 +1076,7 @@ async function fetchFromSoundCloudQuery(
 
   const items: any[] = [];
   const seenIds = new Set<number>();
-  for (const list of [artistCatalogItems, searchItems, altItems]) {
+  for (const list of [artistCatalogItems, searchItems]) {
     for (const it of list) {
       if (it?.id && !seenIds.has(it.id)) {
         seenIds.add(it.id);
@@ -1079,7 +1097,7 @@ async function fetchFromSoundCloudQuery(
     return true;
   });
 
-  const rankWithTolerance = (maxTol?: number) =>
+  const rankTracks = (maxTol?: number, maxExtraWords = 1, minScore = 280) =>
     validPlayableItems
       .map((item) => {
         const durSec = (item.duration || 0) / 1000;
@@ -1096,11 +1114,12 @@ async function fetchFromSoundCloudQuery(
           candidateGenre: genreStr,
           candidateDescription: descStr,
           candidateDurationSec: durSec,
-          targetTitle: cleanTrackQuery(targetTitle),
+          targetTitle: strippedTitle || cleanTrackQuery(targetTitle),
           targetArtist,
-          fallbackQuery: cleanQuery,
+          fallbackQuery: primaryQuery,
           expectedDurationSec,
           maxDurationToleranceSec: maxTol,
+          maxExtraWords,
         });
 
         if (score >= 0) {
@@ -1136,15 +1155,15 @@ async function fetchFromSoundCloudQuery(
 
         return { item, score };
       })
-      .filter((entry) => entry.score >= 300)
+      .filter((entry) => entry.score >= minScore)
       .sort((a, b) => b.score - a.score)
       .map((entry) => entry.item);
 
-  // 1-й проход: строгое совпадение студийной длительности (±6 сек), 2-й проход: ±12 сек (если версия с небольшим интро/аутро)
-  let rankedTracks = rankWithTolerance();
-  if (rankedTracks.length === 0 && expectedDurationSec > 0) {
-    rankedTracks = rankWithTolerance(12);
-  }
+  // Проход 1: строгий оригинал; Проход 2: допускаем до 3 слов (альбом/год в заголовке) и ±20с
+  const pass1 = rankTracks(undefined, 1, 280);
+  const pass1Ids = new Set(pass1.map((t) => t.id));
+  const pass2 = rankTracks(20, 3, 220).filter((t) => !pass1Ids.has(t.id));
+  const rankedTracks = [...pass1, ...pass2];
 
   for (const track of rankedTracks) {
     const compatible = track.media.transcodings.filter(isSafariCompatibleTranscoding);
@@ -1166,7 +1185,7 @@ async function fetchFromSoundCloudQuery(
     for (const tc of orderedTranscodings) {
       try {
         const infoRes = await fetch(`${tc.url}?client_id=${clientId}`, {
-          signal: AbortSignal.timeout(3000),
+          signal: AbortSignal.timeout(2500),
         });
         if (!infoRes.ok) continue;
         const info = await infoRes.json();
@@ -1185,13 +1204,17 @@ async function fetchFromSoundCloudQuery(
           };
         }
 
-        const built = await buildHlsAudioBuffer(info.url, expectedDurationSec, hintMime);
         const bufKey = `${cacheKey}:sc:${track.id}:${tc.preset || 'hls'}`;
-        setBufferCache(bufKey, {
-          bytes: built.bytes,
-          contentType: built.contentType,
-          expiresAt: Date.now() + 1000 * 60 * 30,
-        });
+        let bufPromise = inFlightBufferPromises.get(bufKey);
+        if (!bufPromise) {
+          bufPromise = buildHlsAudioBuffer(info.url, expectedDurationSec, hintMime).finally(() => {
+            inFlightBufferPromises.delete(bufKey);
+          });
+          inFlightBufferPromises.set(bufKey, bufPromise);
+        }
+
+        const built = await bufPromise;
+        setBufferCache(bufKey, built);
 
         return {
           url: info.url,
@@ -1248,47 +1271,45 @@ function serveCachedBuffer(req: NextRequest, cached: CachedBuffer, isHead: boole
   });
 }
 
-async function getAudioSource(
+async function resolveAudioSourceUncached(
   rawId: string,
   targetTitle: string,
   targetArtist: string,
   expectedDurationSec: number,
   cacheKey: string
 ): Promise<AudioSource> {
-  const cached = streamUrlCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    if (!cached.isHls || (cached.bufferKey && fullAudioBufferCache.has(cached.bufferKey))) {
-      return cached;
-    }
-  }
-
   let resolvedTitle = targetTitle;
   let resolvedArtist = targetArtist;
-  let query = resolvedTitle
-    ? resolvedArtist
-      ? `${resolvedArtist} ${resolvedTitle}`
-      : resolvedTitle
-    : '';
 
   if (rawId.startsWith('ytq:')) {
     const rawYtq = safeDecode(rawId.split(':').slice(2).join(':')).trim();
-    if (!query) query = rawYtq;
     if (!resolvedTitle) {
       const parts = rawYtq.split(' - ');
-      resolvedArtist = parts.length > 1 ? parts[0].trim() : '';
-      resolvedTitle = parts.length > 1 ? parts.slice(1).join(' - ').trim() : rawYtq;
+      if (parts.length > 1 && !DASH_RELEASE_TAG_RE.test(` - ${parts.slice(1).join(' - ')}`)) {
+        resolvedArtist = parts[0].trim();
+        resolvedTitle = parts.slice(1).join(' - ').trim();
+      } else {
+        resolvedTitle = rawYtq;
+      }
     }
   }
+
+  const strippedTitle = stripFeaturingAndTags(resolvedTitle);
+  const query = strippedTitle
+    ? resolvedArtist
+      ? `${resolvedArtist} ${strippedTitle}`
+      : strippedTitle
+    : '';
 
   let effectiveDuration = expectedDurationSec;
   let videoId: string | null = !rawId.startsWith('ytq:') ? rawId : null;
 
   const [refDur, ytmHit] = await Promise.all([
-    !effectiveDuration && resolvedTitle
-      ? lookupReferenceDurationSec(resolvedTitle, resolvedArtist)
+    !effectiveDuration && strippedTitle
+      ? lookupReferenceDurationSec(strippedTitle, resolvedArtist)
       : Promise.resolve(0),
-    !videoId && query
-      ? searchYoutubeMusicSong(query, resolvedTitle, resolvedArtist, effectiveDuration)
+    !videoId && query && ytBlockedUntil <= Date.now()
+      ? searchYoutubeMusicSong(query, strippedTitle, resolvedArtist, effectiveDuration)
       : Promise.resolve(null),
   ]);
 
@@ -1299,7 +1320,7 @@ async function getAudioSource(
     videoId = ytmHit.videoId;
   }
 
-  if (videoId) {
+  if (videoId && ytBlockedUntil <= Date.now()) {
     try {
       const ytSource = await tryYoutubeDirect(videoId);
       streamUrlCache.set(cacheKey, {
@@ -1311,13 +1332,12 @@ async function getAudioSource(
       if (!resolvedTitle) {
         const oembedRes = await fetch(
           `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
-          { signal: AbortSignal.timeout(2500) }
+          { signal: AbortSignal.timeout(2000) }
         ).catch(() => null);
         if (oembedRes?.ok) {
           const data = await oembedRes.json();
           resolvedTitle = cleanTrackQuery(String(data?.title || ''));
           resolvedArtist = String(data?.author_name || '').replace(/\s*-\s*Topic$/i, '').trim();
-          query = `${resolvedArtist} ${resolvedTitle}`.trim();
           if (!effectiveDuration && resolvedTitle) {
             effectiveDuration = await lookupReferenceDurationSec(resolvedTitle, resolvedArtist);
           }
@@ -1340,6 +1360,38 @@ async function getAudioSource(
   });
 
   return scSource;
+}
+
+async function getAudioSource(
+  rawId: string,
+  targetTitle: string,
+  targetArtist: string,
+  expectedDurationSec: number,
+  cacheKey: string
+): Promise<AudioSource> {
+  const cached = streamUrlCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    if (!cached.isHls || (cached.bufferKey && fullAudioBufferCache.has(cached.bufferKey))) {
+      return cached;
+    }
+  }
+
+  // Дедупликация одновременных запросов (prefetch=1 и <audio> делят один промис)
+  let inFlight = inFlightSourcePromises.get(cacheKey);
+  if (!inFlight) {
+    inFlight = resolveAudioSourceUncached(
+      rawId,
+      targetTitle,
+      targetArtist,
+      expectedDurationSec,
+      cacheKey
+    ).finally(() => {
+      inFlightSourcePromises.delete(cacheKey);
+    });
+    inFlightSourcePromises.set(cacheKey, inFlight);
+  }
+
+  return inFlight;
 }
 
 async function handleStream(
@@ -1370,26 +1422,29 @@ async function handleStream(
       cacheKey
     );
 
-    // Во время prefetch прогреваем прогрессивный поток в память, чтобы на iPhone в фоне трек стартовал за 20мс
     if (isPrefetch) {
-      if (!source.isHls && !fullAudioBufferCache.has(cacheKey)) {
-        fetch(source.url, {
+      if (!source.isHls && !fullAudioBufferCache.has(cacheKey) && !inFlightBufferPromises.has(cacheKey)) {
+        const p = fetch(source.url, {
           headers: { 'User-Agent': source.userAgent },
-          signal: AbortSignal.timeout(6000),
+          signal: AbortSignal.timeout(5000),
         })
           .then(async (r) => {
-            if (!r.ok) return;
+            if (!r.ok) throw new Error('Prefetch failed');
             const len = Number(r.headers.get('content-length') || 0);
-            if (len > 0 && len <= 18 * 1024 * 1024) {
-              const bytes = new Uint8Array(await r.arrayBuffer());
-              setBufferCache(cacheKey, {
-                bytes,
-                contentType: r.headers.get('content-type') || source.mimeType,
-                expiresAt: Date.now() + 1000 * 60 * 30,
-              });
-            }
+            if (len <= 0 || len > 18 * 1024 * 1024) throw new Error('Too large');
+            const entry: CachedBuffer = {
+              bytes: new Uint8Array(await r.arrayBuffer()),
+              contentType: r.headers.get('content-type') || source.mimeType,
+              expiresAt: Date.now() + 1000 * 60 * 30,
+            };
+            setBufferCache(cacheKey, entry);
+            return entry;
           })
-          .catch(() => {});
+          .finally(() => {
+            inFlightBufferPromises.delete(cacheKey);
+          });
+        inFlightBufferPromises.set(cacheKey, p);
+        p.catch(() => {});
       }
       return NextResponse.json({ ok: true });
     }

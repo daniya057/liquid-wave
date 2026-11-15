@@ -14,10 +14,26 @@ export const EQ_PRESETS: Record<string, number[]> = {
   chill: [2, 1, 0, -2, -3],
 };
 
+function isIOSDevice(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  return (
+    /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+  );
+}
+
 export function useAudioEngine(onEnded?: () => void) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const onEndedRef = useRef(onEnded);
   const shouldPlayRef = useRef(false);
+  const lastSrcRef = useRef('');
+  const lastPosUpdateRef = useRef(0);
+  const playRequestIdRef = useRef(0);
+
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const filtersRef = useRef<BiquadFilterNode[]>([]);
+  const graphConnectedRef = useRef(false);
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -31,13 +47,107 @@ export function useAudioEngine(onEnded?: () => void) {
     onEndedRef.current = onEnded;
   }, [onEnded]);
 
+  const ensureAudioGraph = useCallback(
+    (forceConnect = false) => {
+      if (typeof window === 'undefined') return;
+      const audio = audioRef.current;
+      if (!audio) return;
+
+      if (isIOSDevice() && !forceConnect && !graphConnectedRef.current) {
+        return;
+      }
+
+      try {
+        const AudioCtx =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        if (!AudioCtx) return;
+
+        if (!audioCtxRef.current) {
+          const ctx = new AudioCtx();
+          audioCtxRef.current = ctx;
+
+          ctx.addEventListener('statechange', () => {
+            if (
+              (ctx.state === 'suspended' || (ctx.state as string) === 'interrupted') &&
+              shouldPlayRef.current
+            ) {
+              ctx.resume().catch(() => {});
+            }
+          });
+        }
+
+        const ctx = audioCtxRef.current;
+        if (ctx.state === 'suspended' || (ctx.state as string) === 'interrupted') {
+          ctx.resume().catch(() => {});
+        }
+
+        if (!graphConnectedRef.current) {
+          if (!sourceNodeRef.current) {
+            sourceNodeRef.current = ctx.createMediaElementSource(audio);
+          }
+
+          const filters = EQ_FREQUENCIES.map((freq, idx) => {
+            const filter = ctx.createBiquadFilter();
+            filter.type =
+              idx === 0 ? 'lowshelf' : idx === EQ_FREQUENCIES.length - 1 ? 'highshelf' : 'peaking';
+            filter.frequency.value = freq;
+            filter.Q.value = 1;
+            filter.gain.value = eqGains[idx] || 0;
+            return filter;
+          });
+
+          filtersRef.current = filters;
+
+          let prev: AudioNode = sourceNodeRef.current;
+          for (const f of filters) {
+            prev.connect(f);
+            prev = f;
+          }
+          prev.connect(ctx.destination);
+          graphConnectedRef.current = true;
+        }
+      } catch {
+        // Нативный <audio> работает напрямую
+      }
+    },
+    [eqGains]
+  );
+
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
 
+    const updateMediaPosition = () => {
+      if (
+        typeof navigator !== 'undefined' &&
+        'mediaSession' in navigator &&
+        typeof navigator.mediaSession.setPositionState === 'function' &&
+        audio.duration &&
+        isFinite(audio.duration) &&
+        audio.duration > 0
+      ) {
+        try {
+          navigator.mediaSession.setPositionState({
+            duration: audio.duration,
+            playbackRate: audio.playbackRate || 1,
+            position: Math.min(audio.currentTime || 0, audio.duration),
+          });
+        } catch {}
+      }
+    };
+
     const handlePlaying = () => {
       setIsPlaying(true);
       setIsLoading(false);
+      if (
+        audioCtxRef.current &&
+        (audioCtxRef.current.state === 'suspended' ||
+          (audioCtxRef.current.state as string) === 'interrupted')
+      ) {
+        audioCtxRef.current.resume().catch(() => {});
+      }
+      updateMediaPosition();
     };
 
     const handlePause = () => {
@@ -55,9 +165,14 @@ export function useAudioEngine(onEnded?: () => void) {
     };
 
     const handleTimeUpdate = () => {
+      const now = Date.now();
       setCurrentTime(audio.currentTime || 0);
       if (audio.duration && isFinite(audio.duration)) {
         setDuration(audio.duration);
+      }
+      if (now - lastPosUpdateRef.current > 2000) {
+        lastPosUpdateRef.current = now;
+        updateMediaPosition();
       }
     };
 
@@ -65,6 +180,7 @@ export function useAudioEngine(onEnded?: () => void) {
       setIsLoading(false);
       if (audio.duration && isFinite(audio.duration)) {
         setDuration(audio.duration);
+        updateMediaPosition();
       }
     };
 
@@ -106,49 +222,78 @@ export function useAudioEngine(onEnded?: () => void) {
     };
   }, []);
 
-  const playStream = useCallback(async (src: string) => {
-    const audio = audioRef.current;
-    if (!audio || typeof src !== 'string' || !src) return;
+  const playStream = useCallback(
+    async (src: string) => {
+      const audio = audioRef.current;
+      if (!audio || typeof src !== 'string' || !src) return;
 
-    shouldPlayRef.current = true;
-    setIsLoading(true);
-    setCurrentTime(0);
-    setDuration(0);
+      ensureAudioGraph(false);
 
-    audio.pause();
-    audio.src = src;
-    audio.load();
+      const reqId = ++playRequestIdRef.current;
+      lastSrcRef.current = src;
+      shouldPlayRef.current = true;
+      setIsLoading(true);
+      setCurrentTime(0);
+      setDuration(0);
 
-    try {
-      await audio.play();
-      setIsPlaying(true);
-    } catch {
-      setIsPlaying(false);
-    } finally {
-      setIsLoading(false);
-    }
-  }, []);
+      audio.pause();
+      audio.src = src;
+      audio.load();
+
+      try {
+        await audio.play();
+        if (playRequestIdRef.current === reqId) {
+          setIsPlaying(true);
+        }
+      } catch {
+        if (playRequestIdRef.current === reqId) {
+          setIsPlaying(false);
+        }
+      } finally {
+        if (playRequestIdRef.current === reqId) {
+          setIsLoading(false);
+        }
+      }
+    },
+    [ensureAudioGraph]
+  );
 
   const togglePlay = useCallback(async () => {
     const audio = audioRef.current;
     if (!audio) return;
 
+    const src = audio.currentSrc || audio.src || lastSrcRef.current;
+    if (!src) return;
+
+    ensureAudioGraph(false);
+
     if (audio.paused || audio.ended || audio.error) {
+      const reqId = ++playRequestIdRef.current;
+      if (audio.error || audio.readyState === 0 || !audio.src) {
+        audio.src = src;
+        audio.load();
+      }
       shouldPlayRef.current = true;
       setIsLoading(true);
       try {
         await audio.play();
-        setIsPlaying(true);
+        if (playRequestIdRef.current === reqId) {
+          setIsPlaying(true);
+        }
       } catch {
-        setIsPlaying(false);
+        if (playRequestIdRef.current === reqId) {
+          setIsPlaying(false);
+        }
       } finally {
-        setIsLoading(false);
+        if (playRequestIdRef.current === reqId) {
+          setIsLoading(false);
+        }
       }
     } else {
       shouldPlayRef.current = false;
       audio.pause();
     }
-  }, []);
+  }, [ensureAudioGraph]);
 
   const pause = useCallback(() => {
     shouldPlayRef.current = false;
@@ -174,8 +319,38 @@ export function useAudioEngine(onEnded?: () => void) {
     }
   }, []);
 
-  const updateBandGain = useCallback((_bandIndex: number, _gain: number) => {}, []);
-  const applyPreset = useCallback((_presetName: string) => {}, []);
+  const updateBandGain = useCallback(
+    (bandIndex: number, gain: number) => {
+      ensureAudioGraph(true);
+      setEqGains((prev) => {
+        const next = [...prev];
+        next[bandIndex] = gain;
+        return next;
+      });
+      if (filtersRef.current[bandIndex]) {
+        filtersRef.current[bandIndex].gain.value = gain;
+      }
+      setActivePreset('custom');
+    },
+    [ensureAudioGraph]
+  );
+
+  const applyPreset = useCallback(
+    (presetName: string) => {
+      const gains = EQ_PRESETS[presetName] || EQ_PRESETS.flat;
+      if (gains.some((g) => g !== 0)) {
+        ensureAudioGraph(true);
+      }
+      setEqGains(gains);
+      setActivePreset(presetName);
+      gains.forEach((g, idx) => {
+        if (filtersRef.current[idx]) {
+          filtersRef.current[idx].gain.value = g;
+        }
+      });
+    },
+    [ensureAudioGraph]
+  );
 
   return {
     audioRef,

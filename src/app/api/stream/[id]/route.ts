@@ -132,6 +132,9 @@ const SUBSTRING_BANNED_WORDS = [
   'замедл',
 ];
 
+const DESCRIPTION_BANNED_RE =
+  /\b(?:my\s+cover|guitar\s+cover|drum\s+cover|vocal\s+cover|piano\s+cover|bass\s+cover|remix\s+by|bootleg|mashup|slowed\s*\+?\s*reverb|nightcore|instrumental\s+version|karaoke\s+version|кавер\s+на|мой\s+ремикс|минус\s+песни)\b/i;
+
 const BENIGN_BRACKET_RE =
   /^(?:\d{4}|official|official\s+audio|official\s+video|official\s+music\s+video|music\s+video|lyric|lyrics|lyric\s+video|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|original|original\s+mix|album\s+version|single\s+version|full|full\s+song|full\s+track|remaster(?:ed)?(?:\s+\d{4})?|from\s+.+|feat\.?\s+.+|ft\.?\s+.+|with\s+.+|prod\.?\s+.+|клип|премьера|текст|аудио|видео|официальный|оригинал)$/i;
 
@@ -218,6 +221,11 @@ function safeDecode(value: string): string {
   }
 }
 
+function extractMainArtist(artist: string): string {
+  // Не режем по "&", чтобы не ломать дуэты вроде "Miyagi & Эндшпиль" или "Simon & Garfunkel"
+  return artist.split(/\s+(?:feat\.?|ft\.?|featuring)\s+|,\s*/i)[0].trim();
+}
+
 function stripFeaturingAndTags(raw: string): string {
   return raw
     .replace(/\((?:feat\.?|ft\.?|with|prod\.?)\s+[^)]+\)/gi, '')
@@ -249,9 +257,6 @@ function cleanTrackQuery(raw: string): string {
     .trim();
 }
 
-/**
- * Извлекает значимые слова, сохраняя короткие слова названия (например, "I" в "The Devil in I")
- */
 function tokenize(text: string): string[] {
   const matches = text.toLowerCase().match(/[\p{L}\p{N}]+/gu) || [];
   return matches.filter((w) => !NOISE_WORDS.has(w));
@@ -315,7 +320,7 @@ function hasSuspiciousParenthetical(candidateTitle: string, allowedContext: stri
 }
 
 function setBufferCache(key: string, entry: CachedBuffer) {
-  if (fullAudioBufferCache.size >= 12) {
+  if (fullAudioBufferCache.size >= 16) {
     const oldestKey = fullAudioBufferCache.keys().next().value;
     if (oldestKey) fullAudioBufferCache.delete(oldestKey);
   }
@@ -323,11 +328,11 @@ function setBufferCache(key: string, entry: CachedBuffer) {
 }
 
 /**
- * Узнаёт точную студийную длительность оригинала (iTunes -> LRCLIB)
+ * Узнаёт точную студийную длительность оригинала одновременно из Deezer, iTunes и LRCLIB
  */
 async function lookupReferenceDurationSec(title: string, artist: string): Promise<number> {
   const cleanT = stripFeaturingAndTags(title);
-  const primaryA = artist.split(/[,&]|feat\.?|ft\.?/i)[0].trim();
+  const primaryA = extractMainArtist(artist);
   const key = `${primaryA.toLowerCase()}|${cleanT.toLowerCase()}`;
   if (!cleanT) return 0;
 
@@ -336,94 +341,127 @@ async function lookupReferenceDurationSec(title: string, artist: string): Promis
     return cached.durationSec;
   }
 
-  // 1. iTunes Search API — самый точный источник длительности официальных студийных релизов
-  try {
-    const term = `${primaryA} ${cleanT}`.trim();
-    const res = await fetch(
-      `https://itunes.apple.com/search?term=${encodeURIComponent(term)}&media=music&entity=song&limit=8`,
-      { signal: AbortSignal.timeout(2500) }
-    );
-    if (res.ok) {
-      const data = await res.json();
-      const results = Array.isArray(data?.results) ? data.results : [];
-      const targetTitleSet = buildTokenSet(cleanT);
-      const targetArtistSet = buildTokenSet(primaryA);
+  const targetTitleSet = buildTokenSet(cleanT);
+  const targetArtistSet = buildTokenSet(primaryA);
+  const allowedCtx = `${primaryA} ${cleanT}`;
 
-      const exactHit = results.find((r: any) => {
-        const ms = Number(r?.trackTimeMillis || 0);
-        if (ms < 50000 || ms > 900000) return false;
-        const rTitle = String(r?.trackName || '');
-        const rArtist = String(r?.artistName || '');
-        if (hasUnwantedVariant(rTitle, `${primaryA} ${cleanT}`)) return false;
-        const rTitleTokens = tokenize(stripFeaturingAndTags(rTitle));
-        const rArtistSet = buildTokenSet(rArtist);
-        const titleOk =
-          rTitleTokens.length > 0 && rTitleTokens.some((t) => tokensMatch(t, targetTitleSet));
-        const artistOk =
-          targetArtistSet.size === 0 ||
-          [...targetArtistSet].some((t) => tokensMatch(t, rArtistSet));
-        return titleOk && artistOk;
-      });
+  const isValidStudioMatch = (candTitle: string, candArtist: string, durSec: number): boolean => {
+    if (durSec < 45 || durSec > 900) return false;
+    if (hasUnwantedVariant(`${candArtist} ${candTitle}`, allowedCtx)) return false;
+    const cTitleTokens = tokenize(stripFeaturingAndTags(candTitle));
+    const cArtistSet = buildTokenSet(candArtist);
+    const titleOk =
+      cTitleTokens.length > 0 && cTitleTokens.every((t) => tokensMatch(t, targetTitleSet));
+    const artistOk =
+      targetArtistSet.size === 0 ||
+      [...targetArtistSet].some((t) => tokensMatch(t, cArtistSet));
+    return titleOk && artistOk;
+  };
 
-      const fallbackHit = results.find(
-        (r: any) => Number(r?.trackTimeMillis) >= 60000 && Number(r?.trackTimeMillis) <= 900000
-      );
-      const chosen = exactHit || fallbackHit;
-      if (chosen?.trackTimeMillis) {
-        const sec = Math.round(Number(chosen.trackTimeMillis) / 1000);
-        durationLookupCache.set(key, {
-          durationSec: sec,
-          expiresAt: Date.now() + 1000 * 60 * 60 * 24,
-        });
-        return sec;
-      }
-    }
-  } catch {}
+  const term = `${primaryA} ${cleanT}`.trim();
 
-  // 2. LRCLIB fallback
-  try {
-    const url = `https://lrclib.net/api/search?track_name=${encodeURIComponent(cleanT)}&artist_name=${encodeURIComponent(primaryA)}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(2500) });
-    if (res.ok) {
-      const list = await res.json();
-      if (Array.isArray(list) && list.length > 0) {
-        const hit = list.find(
-          (item: any) => Number(item?.duration) >= 60 && Number(item?.duration) <= 900
+  const [deezerDur, itunesDur, lrclibDur] = await Promise.all([
+    // 1. Deezer Public API (огромная база с точной длительностью до секунды)
+    (async () => {
+      try {
+        const res = await fetch(
+          `https://api.deezer.com/search?q=${encodeURIComponent(term)}&limit=6`,
+          { signal: AbortSignal.timeout(2500) }
         );
-        if (hit?.duration) {
-          const sec = Math.round(Number(hit.duration));
-          durationLookupCache.set(key, {
-            durationSec: sec,
-            expiresAt: Date.now() + 1000 * 60 * 60 * 24,
-          });
-          return sec;
-        }
+        if (!res.ok) return 0;
+        const data = await res.json();
+        const items = Array.isArray(data?.data) ? data.data : [];
+        const hit = items.find((it: any) =>
+          isValidStudioMatch(
+            String(it?.title || ''),
+            String(it?.artist?.name || ''),
+            Number(it?.duration || 0)
+          )
+        );
+        return hit ? Number(hit.duration) : 0;
+      } catch {
+        return 0;
       }
-    }
-  } catch {}
+    })(),
 
-  return 0;
+    // 2. iTunes Search API
+    (async () => {
+      try {
+        const res = await fetch(
+          `https://itunes.apple.com/search?term=${encodeURIComponent(term)}&media=music&entity=song&limit=6`,
+          { signal: AbortSignal.timeout(2500) }
+        );
+        if (!res.ok) return 0;
+        const data = await res.json();
+        const results = Array.isArray(data?.results) ? data.results : [];
+        const hit = results.find((r: any) =>
+          isValidStudioMatch(
+            String(r?.trackName || ''),
+            String(r?.artistName || ''),
+            Math.round(Number(r?.trackTimeMillis || 0) / 1000)
+          )
+        );
+        return hit ? Math.round(Number(hit.trackTimeMillis) / 1000) : 0;
+      } catch {
+        return 0;
+      }
+    })(),
+
+    // 3. LRCLIB
+    (async () => {
+      try {
+        const url = `https://lrclib.net/api/search?track_name=${encodeURIComponent(cleanT)}&artist_name=${encodeURIComponent(primaryA)}`;
+        const res = await fetch(url, { signal: AbortSignal.timeout(2500) });
+        if (!res.ok) return 0;
+        const list = await res.json();
+        if (!Array.isArray(list)) return 0;
+        const hit = list.find((item: any) =>
+          isValidStudioMatch(
+            String(item?.trackName || ''),
+            String(item?.artistName || ''),
+            Math.round(Number(item?.duration || 0))
+          )
+        );
+        return hit ? Math.round(Number(hit.duration)) : 0;
+      } catch {
+        return 0;
+      }
+    })(),
+  ]);
+
+  const resolved = deezerDur || itunesDur || lrclibDur || 0;
+  if (resolved > 0) {
+    durationLookupCache.set(key, {
+      durationSec: resolved,
+      expiresAt: Date.now() + 1000 * 60 * 60 * 24,
+    });
+  }
+  return resolved;
 }
 
 function scoreCandidateMatch(params: {
   candidateTitle: string;
   candidateArtist: string;
   candidateGenre?: string;
+  candidateDescription?: string;
   candidateDurationSec: number;
   targetTitle: string;
   targetArtist: string;
   fallbackQuery: string;
   expectedDurationSec: number;
+  maxDurationToleranceSec?: number;
 }): number {
   const {
     candidateTitle,
     candidateArtist,
     candidateGenre = '',
+    candidateDescription = '',
     candidateDurationSec,
     targetTitle,
     targetArtist,
     fallbackQuery,
     expectedDurationSec,
+    maxDurationToleranceSec,
   } = params;
 
   const allowedContext = `${targetArtist} ${targetTitle} ${fallbackQuery}`.trim();
@@ -434,12 +472,21 @@ function scoreCandidateMatch(params: {
     return -10000;
   }
 
-  // 2. Блокируем подозрительные пометки в скобках
+  // 2. Проверяем описание трека (часто пишут "my guitar cover / remix" только в описании)
+  if (
+    candidateDescription &&
+    !hasUnwantedVariant(allowedContext, '') &&
+    DESCRIPTION_BANNED_RE.test(candidateDescription.slice(0, 300))
+  ) {
+    return -10000;
+  }
+
+  // 3. Блокируем подозрительные пометки в скобках
   if (hasSuspiciousParenthetical(candidateTitle, allowedContext)) {
     return -10000;
   }
 
-  // 3. Строгая проверка длительности (±7 сек при известной студийной длительности)
+  // 4. Жёсткая проверка длительности
   const allowsShort = /(?:^|\s)(?:intro|outro|skit|interlude|интро|аутро|скит|интерлюдия)(?:\s|$)/i.test(
     allowedContext
   );
@@ -449,7 +496,8 @@ function scoreCandidateMatch(params: {
 
   if (candidateDurationSec > 0) {
     if (expectedDurationSec > 0) {
-      const tolerance = Math.max(7, Math.min(14, Math.round(expectedDurationSec * 0.04)));
+      const tolerance =
+        maxDurationToleranceSec ?? Math.max(6, Math.min(10, Math.round(expectedDurationSec * 0.03)));
       if (Math.abs(candidateDurationSec - expectedDurationSec) > tolerance) {
         return -10000;
       }
@@ -459,7 +507,7 @@ function scoreCandidateMatch(params: {
     }
   }
 
-  // 4. Двусторонняя проверка совпадения слов названия
+  // 5. Двусторонняя проверка совпадения слов названия
   const candAllTokens = buildTokenSet(`${candidateArtist} ${candidateTitle}`);
   const strippedCandTitle = stripFeaturingAndTags(candidateTitle);
   const candTitleTokenList = tokenize(strippedCandTitle);
@@ -477,7 +525,7 @@ function scoreCandidateMatch(params: {
   }
 
   const titleRatio = matchedTitleCount / titleTokens.length;
-  const minTitleRatio = titleTokens.length <= 3 ? 1.0 : 0.8;
+  const minTitleRatio = titleTokens.length <= 3 ? 1.0 : 0.85;
   if (matchedTitleCount === 0 || titleRatio < minTitleRatio) {
     return -10000;
   }
@@ -491,21 +539,20 @@ function scoreCandidateMatch(params: {
     }
   }
 
-  // Максимум 1 допустимое дополнительное слово (например номер трека "01"), 2+ — уже не оригинал
   if (unexplainedExtraWords >= 2) {
     return -10000;
   }
 
   let score = Math.round(titleRatio * 240);
   if (unexplainedExtraWords === 0) {
-    score += 200;
+    score += 220;
   } else {
-    score -= 120;
+    score -= 130;
   }
 
-  // 5. Проверка присутствия артиста в метаданных ИЛИ заголовке ("Artist - Title")
+  // 6. Проверка присутствия артиста в метаданных ИЛИ заголовке ("Artist - Title")
   if (targetArtist) {
-    const primaryArtist = targetArtist.split(/[,&]|feat\.?|ft\.?/i)[0].trim() || targetArtist;
+    const primaryArtist = extractMainArtist(targetArtist) || targetArtist;
     const artistTokens = tokenize(primaryArtist);
     if (artistTokens.length > 0) {
       let matchedArtistCount = 0;
@@ -513,7 +560,7 @@ function scoreCandidateMatch(params: {
         if (tokensMatch(tok, candAllTokens)) matchedArtistCount++;
       }
       if (matchedArtistCount > 0) {
-        score += Math.round((matchedArtistCount / artistTokens.length) * 240);
+        score += Math.round((matchedArtistCount / artistTokens.length) * 260);
       } else {
         const exactDurationMatch =
           expectedDurationSec > 0 &&
@@ -527,12 +574,12 @@ function scoreCandidateMatch(params: {
     }
   }
 
-  // 6. Бонусы за точную длительность
+  // 7. Бонусы за точную длительность
   if (expectedDurationSec > 0 && candidateDurationSec > 0) {
     const diff = Math.abs(candidateDurationSec - expectedDurationSec);
-    if (diff <= 2) score += 280;
-    else if (diff <= 4) score += 190;
-    else if (diff <= 7) score += 90;
+    if (diff <= 2) score += 300;
+    else if (diff <= 4) score += 200;
+    else if (diff <= 6) score += 100;
   }
 
   return score;
@@ -799,7 +846,7 @@ function isSafariCompatibleTranscoding(t: any): boolean {
 }
 
 async function searchSoundCloudRaw(query: string, clientId: string): Promise<any[]> {
-  const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=40`;
+  const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=45`;
   const res = await fetch(searchUrl, {
     signal: AbortSignal.timeout(4500),
     headers: { 'User-Agent': BROWSER_UA },
@@ -812,14 +859,11 @@ async function searchSoundCloudRaw(query: string, clientId: string): Promise<any
   return Array.isArray(data?.collection) ? data.collection : [];
 }
 
-/**
- * Ищет официальную страницу артиста на SoundCloud и забирает его собственные загруженные треки
- */
 async function fetchOfficialArtistTracksOnSoundCloud(
   artistName: string,
   clientId: string
 ): Promise<any[]> {
-  const cleanArtist = artistName.split(/[,&]|feat\.?|ft\.?/i)[0].trim();
+  const cleanArtist = extractMainArtist(artistName);
   if (!cleanArtist) return [];
 
   try {
@@ -996,10 +1040,9 @@ async function fetchFromSoundCloudQuery(
   const cleanQuery = cleanTrackQuery(rawQuery) || rawQuery;
 
   const strippedTitle = stripFeaturingAndTags(targetTitle);
-  const primaryArtist = targetArtist.split(/[,&]|feat\.?|ft\.?/i)[0].trim();
+  const primaryArtist = extractMainArtist(targetArtist);
   const altQuery = `${primaryArtist} ${strippedTitle}`.trim();
 
-  // Параллельно ищем: 1) общий поиск, 2) треки на странице самого исполнителя
   const [searchItems, artistCatalogItems, altItems] = await Promise.all([
     searchSoundCloudRaw(cleanQuery, clientId),
     primaryArtist ? fetchOfficialArtistTracksOnSoundCloud(primaryArtist, clientId) : Promise.resolve([]),
@@ -1026,73 +1069,82 @@ async function fetchFromSoundCloudQuery(
 
   const primaryArtistTokens = tokenize(primaryArtist);
 
-  const rankedTracks = items
-    .filter((item) => {
-      if (!Array.isArray(item?.media?.transcodings)) return false;
-      if (item.policy === 'BLOCK' || item.policy === 'SNIP') return false;
-      const dur = Number(item.duration || 0);
-      const fullDur = Number(item.full_duration || dur);
-      if (fullDur - dur > 5000) return false;
-      if (dur < 45000) return false;
-      return true;
-    })
-    .map((item) => {
-      const durSec = (item.duration || 0) / 1000;
-      const titleStr = String(item.title || '');
-      const artistStr = [item.user?.username, item.publisher_metadata?.artist]
-        .filter(Boolean)
-        .join(' ');
-      const genreStr = String(item.genre || '');
+  const validPlayableItems = items.filter((item) => {
+    if (!Array.isArray(item?.media?.transcodings)) return false;
+    if (item.policy === 'BLOCK' || item.policy === 'SNIP') return false;
+    const dur = Number(item.duration || 0);
+    const fullDur = Number(item.full_duration || dur);
+    if (fullDur - dur > 5000) return false;
+    if (dur < 45000) return false;
+    return true;
+  });
 
-      let score = scoreCandidateMatch({
-        candidateTitle: titleStr,
-        candidateArtist: artistStr,
-        candidateGenre: genreStr,
-        candidateDurationSec: durSec,
-        targetTitle: cleanTrackQuery(targetTitle),
-        targetArtist,
-        fallbackQuery: cleanQuery,
-        expectedDurationSec,
-      });
+  const rankWithTolerance = (maxTol?: number) =>
+    validPlayableItems
+      .map((item) => {
+        const durSec = (item.duration || 0) / 1000;
+        const titleStr = String(item.title || '');
+        const artistStr = [item.user?.username, item.publisher_metadata?.artist]
+          .filter(Boolean)
+          .join(' ');
+        const genreStr = String(item.genre || '');
+        const descStr = String(item.description || '');
 
-      if (score >= 0) {
-        // 1. Максимальный приоритет — трек найден напрямую на странице официального исполнителя
-        if (artistCatalogIds.has(item.id)) {
-          score += 450;
+        let score = scoreCandidateMatch({
+          candidateTitle: titleStr,
+          candidateArtist: artistStr,
+          candidateGenre: genreStr,
+          candidateDescription: descStr,
+          candidateDurationSec: durSec,
+          targetTitle: cleanTrackQuery(targetTitle),
+          targetArtist,
+          fallbackQuery: cleanQuery,
+          expectedDurationSec,
+          maxDurationToleranceSec: maxTol,
+        });
+
+        if (score >= 0) {
+          if (artistCatalogIds.has(item.id)) {
+            score += 450;
+          }
+
+          const userTokenSet = buildTokenSet(
+            `${item.user?.username || ''} ${item.publisher_metadata?.artist || ''}`
+          );
+          const isArtistAccount =
+            primaryArtistTokens.length > 0 &&
+            primaryArtistTokens.every((tok) => tokensMatch(tok, userTokenSet));
+
+          if (isArtistAccount) score += 250;
+          if (item.user?.verified) score += 150;
+          if (item.publisher_metadata?.isrc || item.publisher_metadata?.release_title) score += 130;
+
+          const plays = Number(item.playback_count || 0);
+          const likes = Number(item.likes_count || item.favoritings_count || 0);
+          if (plays > 0) {
+            score += Math.min(280, Math.round(Math.log10(plays + 1) * 45));
+          }
+          if (likes > 0) {
+            score += Math.min(150, Math.round(Math.log10(likes + 1) * 34));
+          }
+
+          const hasProgressive = item.media.transcodings.some(
+            (t: any) => isSafariCompatibleTranscoding(t) && t?.format?.protocol === 'progressive'
+          );
+          if (hasProgressive) score += 30;
         }
 
-        const userTokenSet = buildTokenSet(
-          `${item.user?.username || ''} ${item.publisher_metadata?.artist || ''}`
-        );
-        const isArtistAccount =
-          primaryArtistTokens.length > 0 &&
-          primaryArtistTokens.every((tok) => tokensMatch(tok, userTokenSet));
+        return { item, score };
+      })
+      .filter((entry) => entry.score >= 300)
+      .sort((a, b) => b.score - a.score)
+      .map((entry) => entry.item);
 
-        if (isArtistAccount) score += 250;
-        if (item.user?.verified) score += 150;
-        if (item.publisher_metadata?.isrc || item.publisher_metadata?.release_title) score += 120;
-
-        // 2. Главный критерий среди перезаливов — популярность (прослушивания и лайки)
-        const plays = Number(item.playback_count || 0);
-        const likes = Number(item.likes_count || item.favoritings_count || 0);
-        if (plays > 0) {
-          score += Math.min(260, Math.round(Math.log10(plays + 1) * 42));
-        }
-        if (likes > 0) {
-          score += Math.min(140, Math.round(Math.log10(likes + 1) * 32));
-        }
-
-        const hasProgressive = item.media.transcodings.some(
-          (t: any) => isSafariCompatibleTranscoding(t) && t?.format?.protocol === 'progressive'
-        );
-        if (hasProgressive) score += 30;
-      }
-
-      return { item, score };
-    })
-    .filter((entry) => entry.score >= 280)
-    .sort((a, b) => b.score - a.score)
-    .map((entry) => entry.item);
+  // 1-й проход: строгое совпадение студийной длительности (±6 сек), 2-й проход: ±12 сек (если версия с небольшим интро/аутро)
+  let rankedTracks = rankWithTolerance();
+  if (rankedTracks.length === 0 && expectedDurationSec > 0) {
+    rankedTracks = rankWithTolerance(12);
+  }
 
   for (const track of rankedTracks) {
     const compatible = track.media.transcodings.filter(isSafariCompatibleTranscoding);
@@ -1149,13 +1201,11 @@ async function fetchFromSoundCloudQuery(
           isHls: true,
           bufferKey: bufKey,
         };
-      } catch {
-        // Пробуем следующий транскодинг или следующий трек
-      }
+      } catch {}
     }
   }
 
-  throw new Error('No full matching stream on SoundCloud');
+  throw new Error('No original studio stream found');
 }
 
 function serveCachedBuffer(req: NextRequest, cached: CachedBuffer, isHead: boolean): Response {
@@ -1320,8 +1370,33 @@ async function handleStream(
       cacheKey
     );
 
+    // Во время prefetch прогреваем прогрессивный поток в память, чтобы на iPhone в фоне трек стартовал за 20мс
     if (isPrefetch) {
+      if (!source.isHls && !fullAudioBufferCache.has(cacheKey)) {
+        fetch(source.url, {
+          headers: { 'User-Agent': source.userAgent },
+          signal: AbortSignal.timeout(6000),
+        })
+          .then(async (r) => {
+            if (!r.ok) return;
+            const len = Number(r.headers.get('content-length') || 0);
+            if (len > 0 && len <= 18 * 1024 * 1024) {
+              const bytes = new Uint8Array(await r.arrayBuffer());
+              setBufferCache(cacheKey, {
+                bytes,
+                contentType: r.headers.get('content-type') || source.mimeType,
+                expiresAt: Date.now() + 1000 * 60 * 30,
+              });
+            }
+          })
+          .catch(() => {});
+      }
       return NextResponse.json({ ok: true });
+    }
+
+    const prewarmedBuf = fullAudioBufferCache.get(cacheKey);
+    if (prewarmedBuf && prewarmedBuf.expiresAt > Date.now()) {
+      return serveCachedBuffer(req, prewarmedBuf, isHead);
     }
 
     if (source.isHls && source.bufferKey) {

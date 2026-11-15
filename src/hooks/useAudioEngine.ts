@@ -29,6 +29,7 @@ export function useAudioEngine(onEnded?: () => void) {
   const lastSrcRef = useRef('');
   const lastPosUpdateRef = useRef(0);
   const playRequestIdRef = useRef(0);
+  const retryCountRef = useRef(0);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
@@ -47,13 +48,18 @@ export function useAudioEngine(onEnded?: () => void) {
     onEndedRef.current = onEnded;
   }, [onEnded]);
 
+  // Подключаем WebAudio EQ ТОЛЬКО на не-iOS устройствах и только при ненулевом эквалайзере,
+  // иначе iOS Safari замораживает звук при блокировке экрана (таймер идёт, звука нет).
   const ensureAudioGraph = useCallback(
     (forceConnect = false) => {
       if (typeof window === 'undefined') return;
+      if (isIOSDevice()) return;
+
       const audio = audioRef.current;
       if (!audio) return;
 
-      if (isIOSDevice() && !forceConnect && !graphConnectedRef.current) {
+      const hasActiveEq = forceConnect || eqGains.some((g) => g !== 0);
+      if (!hasActiveEq && !graphConnectedRef.current) {
         return;
       }
 
@@ -116,6 +122,14 @@ export function useAudioEngine(onEnded?: () => void) {
     const audio = audioRef.current;
     if (!audio) return;
 
+    const syncMediaSessionPlayback = (state: 'playing' | 'paused') => {
+      if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+        try {
+          navigator.mediaSession.playbackState = state;
+        } catch {}
+      }
+    };
+
     const updateMediaPosition = () => {
       if (
         typeof navigator !== 'undefined' &&
@@ -136,8 +150,10 @@ export function useAudioEngine(onEnded?: () => void) {
     };
 
     const handlePlaying = () => {
+      retryCountRef.current = 0;
       setIsPlaying(true);
       setIsLoading(false);
+      syncMediaSessionPlayback('playing');
       if (
         audioCtxRef.current &&
         (audioCtxRef.current.state === 'suspended' ||
@@ -150,6 +166,7 @@ export function useAudioEngine(onEnded?: () => void) {
 
     const handlePause = () => {
       setIsPlaying(false);
+      syncMediaSessionPlayback('paused');
     };
 
     const handleWaiting = () => {
@@ -160,6 +177,9 @@ export function useAudioEngine(onEnded?: () => void) {
 
     const handleCanPlay = () => {
       setIsLoading(false);
+      if (shouldPlayRef.current && audio.paused) {
+        audio.play().catch(() => {});
+      }
     };
 
     const handleTimeUpdate = () => {
@@ -183,16 +203,31 @@ export function useAudioEngine(onEnded?: () => void) {
     };
 
     const handleEnded = () => {
-      shouldPlayRef.current = false;
       setIsPlaying(false);
       setIsLoading(false);
       if (onEndedRef.current) {
         onEndedRef.current();
+      } else {
+        shouldPlayRef.current = false;
       }
     };
 
     const handleError = () => {
       if (!audio.error) return;
+      // На iOS при переходе сети/фона даём 1 автоматический ретрай перед остановкой
+      if (shouldPlayRef.current && retryCountRef.current < 1 && lastSrcRef.current) {
+        retryCountRef.current += 1;
+        setTimeout(() => {
+          if (!shouldPlayRef.current || !audioRef.current) return;
+          audioRef.current.src = lastSrcRef.current;
+          audioRef.current.play().catch(() => {
+            shouldPlayRef.current = false;
+            setIsLoading(false);
+            setIsPlaying(false);
+          });
+        }, 350);
+        return;
+      }
       shouldPlayRef.current = false;
       setIsLoading(false);
       setIsPlaying(false);
@@ -229,23 +264,24 @@ export function useAudioEngine(onEnded?: () => void) {
       ensureAudioGraph(false);
 
       const reqId = ++playRequestIdRef.current;
+      retryCountRef.current = 0;
       lastSrcRef.current = src;
       shouldPlayRef.current = true;
       setIsLoading(true);
       setCurrentTime(0);
       setDuration(0);
 
-      audio.pause();
+      // ВАЖНО для iOS: не вызываем audio.pause() и audio.load() перед сменой src,
+      // иначе Safari разрывает фоновую аудио-сессию и блокирует воспроизведение на заблокированном экране.
       audio.src = src;
-      audio.load();
 
       try {
         await audio.play();
         if (playRequestIdRef.current === reqId) {
           setIsPlaying(true);
         }
-      } catch {
-        if (playRequestIdRef.current === reqId) {
+      } catch (err: any) {
+        if (playRequestIdRef.current === reqId && err?.name !== 'AbortError') {
           setIsPlaying(false);
         }
       } finally {
@@ -270,7 +306,6 @@ export function useAudioEngine(onEnded?: () => void) {
       const reqId = ++playRequestIdRef.current;
       if (audio.error || audio.readyState === 0 || !audio.src) {
         audio.src = src;
-        audio.load();
       }
       shouldPlayRef.current = true;
       setIsLoading(true);
@@ -279,8 +314,8 @@ export function useAudioEngine(onEnded?: () => void) {
         if (playRequestIdRef.current === reqId) {
           setIsPlaying(true);
         }
-      } catch {
-        if (playRequestIdRef.current === reqId) {
+      } catch (err: any) {
+        if (playRequestIdRef.current === reqId && err?.name !== 'AbortError') {
           setIsPlaying(false);
         }
       } finally {

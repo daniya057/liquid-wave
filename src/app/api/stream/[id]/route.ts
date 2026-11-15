@@ -46,6 +46,7 @@ const UNWANTED_MODIFIERS = [
   'rework',
   're-work',
   're-edit',
+  'reimagined',
   'live',
   'concert',
   'tour',
@@ -53,6 +54,14 @@ const UNWANTED_MODIFIERS = [
   'session',
   'acoustic',
   'unplugged',
+  'fingerstyle',
+  'orchestral',
+  'symphonic',
+  'string quartet',
+  '8-bit',
+  '8bit',
+  'lofi',
+  'lo-fi',
   'slowed',
   'reverb',
   'sped up',
@@ -64,12 +73,17 @@ const UNWANTED_MODIFIERS = [
   'bass boosted',
   'bassboost',
   'cover',
+  'ai cover',
+  'rvc',
+  'sovits',
   'karaoke',
   'instrumental',
   'acapella',
   'a capella',
   'tribute',
   'parody',
+  'demo',
+  'rehearsal',
   'snippet',
   'teaser',
   'type beat',
@@ -90,6 +104,9 @@ const UNWANTED_MODIFIERS = [
   'review',
   'hardstyle',
   'phonk',
+  'dubstep',
+  'dnb',
+  'drum and bass',
   'drum cover',
   'guitar cover',
   'bass cover',
@@ -97,6 +114,10 @@ const UNWANTED_MODIFIERS = [
   'vocal cover',
   'russian version',
   'на русском',
+  'под гитару',
+  'на гитаре',
+  'на пианино',
+  'ии кавер',
   'ремикс',
   'концерт',
   'лайв',
@@ -116,6 +137,8 @@ const UNWANTED_MODIFIERS = [
   'сборник',
   'подкаст',
   'рингтон',
+  'фонк',
+  'лоуфай',
 ];
 
 const SUBSTRING_BANNED_WORDS = [
@@ -129,20 +152,24 @@ const SUBSTRING_BANNED_WORDS = [
   'karaoke',
   'acapella',
   'ringtone',
+  'fingerstyle',
   'ремикс',
   'кавер',
   'найткор',
   'замедл',
 ];
 
+const TAG_LIST_BANNED_RE =
+  /(?:^|[\s"])(?:remix|remixed|rmx|bootleg|mashup|nightcore|slowed|sped\s*up|speedup|karaoke|instrumental|acapella|cover|ai\s*cover|live|acoustic|hardstyle|phonk|lofi|lo-fi|8d|ремикс|кавер|замедл|ускор|минус|лайв)(?:$|[\s"])/i;
+
 const DESCRIPTION_BANNED_RE =
-  /\b(?:my\s+cover|guitar\s+cover|drum\s+cover|vocal\s+cover|piano\s+cover|bass\s+cover|remix\s+by|bootleg|mashup|slowed\s*\+?\s*reverb|nightcore|instrumental\s+version|karaoke\s+version|кавер\s+на|мой\s+ремикс|минус\s+песни)\b/i;
+  /\b(?:my\s+cover|guitar\s+cover|drum\s+cover|vocal\s+cover|piano\s+cover|bass\s+cover|ai\s+cover|remix\s+by|bootleg|mashup|slowed\s*\+?\s*reverb|nightcore|instrumental\s+version|karaoke\s+version|кавер\s+на|мой\s+ремикс|минус\s+песни)\b/i;
 
 const BENIGN_BRACKET_RE =
   /^(?:\d{4}|official|official\s+audio|official\s+video|official\s+music\s+video|music\s+video|lyric|lyrics|lyric\s+video|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|original|original\s+mix|album\s+version|single\s+version|full|full\s+song|full\s+track|remaster(?:ed)?(?:\s+\d{4})?|from\s+.+|feat\.?\s+.+|ft\.?\s+.+|with\s+.+|prod\.?\s+.+|клип|премьера|текст|аудио|видео|официальный|оригинал)$/i;
 
 const DASH_RELEASE_TAG_RE =
-  /\s+-\s+(?:\d{4}\s+)?(?:remaster(?:ed)?(?:\s+\d{4})?|original\s+mix|album\s+version|single\s+version|radio\s+edit|explicit|clean|bonus\s+track|deluxe(?:\s+edition)?|anniversary(?:\s+edition)?|mono|stereo)\b.*$/i;
+  /\s+-\s+(?:\d{4}\s+)?(?:remaster(?:ed)?(?:\s+\d{4})?|mix|original\s+mix|album\s+version|single\s+version|radio\s+edit|explicit|clean|bonus\s+track|deluxe(?:\s+edition)?|anniversary(?:\s+edition)?|mono|stereo)\b.*$/i;
 
 const NOISE_WORDS = new Set([
   'feat',
@@ -261,7 +288,7 @@ function cleanTrackQuery(raw: string): string {
       ''
     )
     .replace(
-      /\[(?:\d{4}|official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|original(?:\s+mix)?|remaster(?:ed)?(?:\s+\d{4})?|клип|премьера|текст|аудио|видео)[^\]]*\]/gi,
+      /\[(?:\d{4}|official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|original(?:\s+mix)?|album\s+version|single\s+version|full(?:\s+song|\s+track)?|remaster(?:ed)?(?:\s+\d{4})?|клип|премьера|текст|аудио|видео)[^\]]*\]/gi,
       ''
     )
     .replace(/\s{2,}/g, ' ')
@@ -448,6 +475,7 @@ function scoreCandidateMatch(params: {
   candidateTitle: string;
   candidateArtist: string;
   candidateGenre?: string;
+  candidateTags?: string;
   candidateDescription?: string;
   candidateDurationSec: number;
   targetTitle: string;
@@ -461,6 +489,7 @@ function scoreCandidateMatch(params: {
     candidateTitle,
     candidateArtist,
     candidateGenre = '',
+    candidateTags = '',
     candidateDescription = '',
     candidateDurationSec,
     targetTitle,
@@ -479,13 +508,15 @@ function scoreCandidateMatch(params: {
     return -10000;
   }
 
-  // 2. Проверяем описание трека
-  if (
-    candidateDescription &&
-    !hasUnwantedVariant(allowedContext, '') &&
-    DESCRIPTION_BANNED_RE.test(candidateDescription.slice(0, 300))
-  ) {
-    return -10000;
+  // 2. Проверяем теги и описание SoundCloud
+  const queryWantsVariant = hasUnwantedVariant(allowedContext, '');
+  if (!queryWantsVariant) {
+    if (candidateTags && TAG_LIST_BANNED_RE.test(candidateTags)) {
+      return -10000;
+    }
+    if (candidateDescription && DESCRIPTION_BANNED_RE.test(candidateDescription.slice(0, 300))) {
+      return -10000;
+    }
   }
 
   // 3. Блокируем подозрительные пометки в скобках
@@ -557,7 +588,7 @@ function scoreCandidateMatch(params: {
     score -= unexplainedExtraWords * 90;
   }
 
-  // 6. Проверка присутствия артиста в метаданных ИЛИ заголовке ("Artist - Title")
+  // 6. Проверка присутствия артиста в метаданных/заголовке ИЛИ тегах/описании
   if (targetArtist) {
     const primaryArtist = extractMainArtist(targetArtist) || targetArtist;
     const artistTokens = tokenize(primaryArtist);
@@ -566,17 +597,26 @@ function scoreCandidateMatch(params: {
       for (const tok of artistTokens) {
         if (tokensMatch(tok, candAllTokens)) matchedArtistCount++;
       }
+
       if (matchedArtistCount > 0) {
         score += Math.round((matchedArtistCount / artistTokens.length) * 260);
       } else {
-        const exactDurationMatch =
-          expectedDurationSec > 0 &&
-          candidateDurationSec > 0 &&
-          Math.abs(candidateDurationSec - expectedDurationSec) <= 3;
-        if (!exactDurationMatch || titleRatio < 1.0 || unexplainedExtraWords > 0) {
-          return -10000;
+        // Проверяем теги и описание (часто перезаливы называют просто "One", а группу пишут в тегах)
+        const metaTokenSet = buildTokenSet(`${candidateTags} ${candidateDescription.slice(0, 250)}`);
+        const matchedInMeta = artistTokens.filter((tok) => tokensMatch(tok, metaTokenSet)).length;
+
+        if (matchedInMeta > 0) {
+          score += Math.round((matchedInMeta / artistTokens.length) * 150);
+        } else {
+          const exactDurationMatch =
+            expectedDurationSec > 0 &&
+            candidateDurationSec > 0 &&
+            Math.abs(candidateDurationSec - expectedDurationSec) <= 4;
+          if (!exactDurationMatch || titleRatio < 1.0 || unexplainedExtraWords > 0) {
+            return -10000;
+          }
+          score -= 40;
         }
-        score -= 50;
       }
     }
   }
@@ -797,7 +837,6 @@ async function tryYoutubeDirect(videoId: string): Promise<AudioSource> {
       ),
     ]);
   } catch (err) {
-    // На Render IP YouTube заблокирован — не тратим 2 секунды на каждый следующий трек
     ytBlockedUntil = Date.now() + 1000 * 60 * 10;
     throw err;
   }
@@ -862,7 +901,7 @@ function isSafariCompatibleTranscoding(t: any): boolean {
 }
 
 async function searchSoundCloudRaw(query: string, clientId: string): Promise<any[]> {
-  const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=45`;
+  const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=50`;
   const res = await fetch(searchUrl, {
     signal: AbortSignal.timeout(3500),
     headers: { 'User-Agent': BROWSER_UA },
@@ -1004,7 +1043,6 @@ async function buildHlsAudioBuffer(
   const chunks: Uint8Array[] = [];
   let totalBytes = 0;
 
-  // Скачиваем пачками по 20 сегментов параллельно для мгновенной сборки
   for (let i = 0; i < allParts.length; i += 20) {
     const batch = allParts.slice(i, i + 20);
     const buffers = await Promise.all(
@@ -1076,29 +1114,30 @@ async function fetchFromSoundCloudQuery(
 
   const items: any[] = [];
   const seenIds = new Set<number>();
-  for (const list of [artistCatalogItems, searchItems]) {
+  const appendUnique = (list: any[]) => {
     for (const it of list) {
       if (it?.id && !seenIds.has(it.id)) {
         seenIds.add(it.id);
         items.push(it);
       }
     }
-  }
+  };
+  appendUnique(artistCatalogItems);
+  appendUnique(searchItems);
 
   const primaryArtistTokens = tokenize(primaryArtist);
 
-  const validPlayableItems = items.filter((item) => {
-    if (!Array.isArray(item?.media?.transcodings)) return false;
-    if (item.policy === 'BLOCK' || item.policy === 'SNIP') return false;
-    const dur = Number(item.duration || 0);
-    const fullDur = Number(item.full_duration || dur);
-    if (fullDur - dur > 5000) return false;
-    if (dur < 45000) return false;
-    return true;
-  });
-
-  const rankTracks = (maxTol?: number, maxExtraWords = 1, minScore = 280) =>
-    validPlayableItems
+  const buildRankedList = (sourceItems: any[], maxTol?: number, maxExtraWords = 1, minScore = 260) =>
+    sourceItems
+      .filter((item) => {
+        if (!Array.isArray(item?.media?.transcodings)) return false;
+        if (item.policy === 'BLOCK' || item.policy === 'SNIP') return false;
+        const dur = Number(item.duration || 0);
+        const fullDur = Number(item.full_duration || dur);
+        if (fullDur - dur > 5000) return false;
+        if (dur < 45000) return false;
+        return true;
+      })
       .map((item) => {
         const durSec = (item.duration || 0) / 1000;
         const titleStr = String(item.title || '');
@@ -1106,12 +1145,14 @@ async function fetchFromSoundCloudQuery(
           .filter(Boolean)
           .join(' ');
         const genreStr = String(item.genre || '');
+        const tagsStr = String(item.tag_list || '');
         const descStr = String(item.description || '');
 
         let score = scoreCandidateMatch({
           candidateTitle: titleStr,
           candidateArtist: artistStr,
           candidateGenre: genreStr,
+          candidateTags: tagsStr,
           candidateDescription: descStr,
           candidateDurationSec: durSec,
           targetTitle: strippedTitle || cleanTrackQuery(targetTitle),
@@ -1159,10 +1200,18 @@ async function fetchFromSoundCloudQuery(
       .sort((a, b) => b.score - a.score)
       .map((entry) => entry.item);
 
-  // Проход 1: строгий оригинал; Проход 2: допускаем до 3 слов (альбом/год в заголовке) и ±20с
-  const pass1 = rankTracks(undefined, 1, 280);
+  let pass1 = buildRankedList(items, undefined, 1, 260);
+
+  // Если в первых 50 результатах были только ремиксы, делаем точный добор по фразе
+  if (pass1.length === 0 && primaryArtist && strippedTitle) {
+    const exactPhraseQuery = `"${primaryArtist}" "${strippedTitle}"`;
+    const extraItems = await searchSoundCloudRaw(exactPhraseQuery, clientId).catch(() => []);
+    appendUnique(extraItems);
+    pass1 = buildRankedList(items, undefined, 1, 260);
+  }
+
   const pass1Ids = new Set(pass1.map((t) => t.id));
-  const pass2 = rankTracks(20, 3, 220).filter((t) => !pass1Ids.has(t.id));
+  const pass2 = buildRankedList(items, 22, 3, 200).filter((t) => !pass1Ids.has(t.id));
   const rankedTracks = [...pass1, ...pass2];
 
   for (const track of rankedTracks) {
@@ -1376,7 +1425,6 @@ async function getAudioSource(
     }
   }
 
-  // Дедупликация одновременных запросов (prefetch=1 и <audio> делят один промис)
   let inFlight = inFlightSourcePromises.get(cacheKey);
   if (!inFlight) {
     inFlight = resolveAudioSourceUncached(
@@ -1493,6 +1541,21 @@ async function handleStream(
 
     if (!upstream || (!upstream.ok && upstream.status !== 206)) {
       return NextResponse.json({ error: 'Upstream stream failed' }, { status: 502 });
+    }
+
+    // Если iOS запросил Range с середины трека после паузы, а CDN вернул 200 вместо 206 —
+    // кэшируем в память и отдаём точный 206 Partial Content, иначе Safari откажется играть
+    if (rangeHeader && upstream.status === 200 && !isHead) {
+      const len = Number(upstream.headers.get('content-length') || 0);
+      if (len > 0 && len <= 20 * 1024 * 1024) {
+        const entry: CachedBuffer = {
+          bytes: new Uint8Array(await upstream.arrayBuffer()),
+          contentType: upstream.headers.get('content-type') || source.mimeType,
+          expiresAt: Date.now() + 1000 * 60 * 30,
+        };
+        setBufferCache(cacheKey, entry);
+        return serveCachedBuffer(req, entry, false);
+      }
     }
 
     const responseHeaders = new Headers();

@@ -22,14 +22,20 @@ function isIOSDevice(): boolean {
   );
 }
 
-export function useAudioEngine(onEnded?: () => void) {
+export function useAudioEngine(onEnded?: () => void, onError?: () => void) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const onEndedRef = useRef(onEnded);
+  const onErrorRef = useRef(onError);
   const shouldPlayRef = useRef(false);
   const lastSrcRef = useRef('');
+  const lastKnownTimeRef = useRef(0);
+  const pendingSeekTimeRef = useRef<number | null>(null);
   const lastPosUpdateRef = useRef(0);
+  const lastNativePlayTimeRef = useRef(0);
   const playRequestIdRef = useRef(0);
   const retryCountRef = useRef(0);
+  const consecutiveErrorsRef = useRef(0);
+  const resumeWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
@@ -48,8 +54,17 @@ export function useAudioEngine(onEnded?: () => void) {
     onEndedRef.current = onEnded;
   }, [onEnded]);
 
-  // Подключаем WebAudio EQ ТОЛЬКО на не-iOS устройствах и только при ненулевом эквалайзере,
-  // иначе iOS Safari замораживает звук при блокировке экрана (таймер идёт, звука нет).
+  useEffect(() => {
+    onErrorRef.current = onError;
+  }, [onError]);
+
+  const clearResumeWatchdog = useCallback(() => {
+    if (resumeWatchdogRef.current) {
+      clearTimeout(resumeWatchdogRef.current);
+      resumeWatchdogRef.current = null;
+    }
+  }, []);
+
   const ensureAudioGraph = useCallback(
     (forceConnect = false) => {
       if (typeof window === 'undefined') return;
@@ -118,6 +133,100 @@ export function useAudioEngine(onEnded?: () => void) {
     [eqGains]
   );
 
+  const resume = useCallback(async () => {
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    const src = audio.currentSrc || audio.src || lastSrcRef.current;
+    if (!src) return;
+
+    ensureAudioGraph(false);
+    clearResumeWatchdog();
+
+    const reqId = ++playRequestIdRef.current;
+    consecutiveErrorsRef.current = 0;
+    shouldPlayRef.current = true;
+
+    const savedTime =
+      audio.currentTime > 0 && isFinite(audio.currentTime)
+        ? audio.currentTime
+        : lastKnownTimeRef.current;
+
+    // Если iOS сбросил буфер или разорвал сетевое соединение во время паузы — переподключаем поток
+    const needsReconnect =
+      Boolean(audio.error) ||
+      audio.readyState === 0 ||
+      audio.networkState === 3 ||
+      !audio.src;
+
+    if (needsReconnect) {
+      if (savedTime > 0.5) {
+        pendingSeekTimeRef.current = savedTime;
+      }
+      audio.src = src;
+    }
+
+    setIsLoading(true);
+    try {
+      await audio.play();
+      if (playRequestIdRef.current === reqId) {
+        setIsPlaying(true);
+      }
+    } catch (err: any) {
+      if (playRequestIdRef.current === reqId && err?.name !== 'AbortError') {
+        // Фолбэк: принудительно переподключаем src с сохранением позиции
+        if (savedTime > 0.5) {
+          pendingSeekTimeRef.current = savedTime;
+        }
+        audio.src = src;
+        audio.play().catch(() => {
+          if (playRequestIdRef.current === reqId) {
+            setIsPlaying(false);
+            setIsLoading(false);
+          }
+        });
+      }
+    }
+
+    // Watchdog для iOS: если через 1.8с после нажатия Play звук так и не пошёл — переподключаем сокет
+    resumeWatchdogRef.current = setTimeout(() => {
+      const el = audioRef.current;
+      if (!el || !shouldPlayRef.current || playRequestIdRef.current !== reqId) return;
+      if (el.paused || el.readyState < 3) {
+        const pos =
+          el.currentTime > 0 && isFinite(el.currentTime)
+            ? el.currentTime
+            : lastKnownTimeRef.current;
+        if (pos > 0.5) {
+          pendingSeekTimeRef.current = pos;
+        }
+        el.src = src;
+        el.play().catch(() => {});
+      }
+    }, 1800);
+  }, [ensureAudioGraph, clearResumeWatchdog]);
+
+  const pause = useCallback(() => {
+    shouldPlayRef.current = false;
+    clearResumeWatchdog();
+    const audio = audioRef.current;
+    if (audio) {
+      if (audio.currentTime > 0 && isFinite(audio.currentTime)) {
+        lastKnownTimeRef.current = audio.currentTime;
+      }
+      if (!audio.paused) {
+        audio.pause();
+      }
+    }
+    setIsPlaying(false);
+    setIsLoading(false);
+    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+      try {
+        navigator.mediaSession.playbackState = 'paused';
+      } catch {}
+    }
+  }, [clearResumeWatchdog]);
+
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
@@ -149,8 +258,17 @@ export function useAudioEngine(onEnded?: () => void) {
       }
     };
 
+    const handlePlayEvent = () => {
+      lastNativePlayTimeRef.current = Date.now();
+      shouldPlayRef.current = true;
+      syncMediaSessionPlayback('playing');
+    };
+
     const handlePlaying = () => {
+      clearResumeWatchdog();
       retryCountRef.current = 0;
+      consecutiveErrorsRef.current = 0;
+      shouldPlayRef.current = true;
       setIsPlaying(true);
       setIsLoading(false);
       syncMediaSessionPlayback('playing');
@@ -165,7 +283,16 @@ export function useAudioEngine(onEnded?: () => void) {
     };
 
     const handlePause = () => {
+      // Игнорируем промежуточную паузу при смене src во время авто-ретрая/переподключения
+      if (!audio.ended && !audio.error && Date.now() - lastNativePlayTimeRef.current > 150) {
+        shouldPlayRef.current = false;
+      }
+      if (audio.currentTime > 0 && isFinite(audio.currentTime)) {
+        lastKnownTimeRef.current = audio.currentTime;
+      }
+      clearResumeWatchdog();
       setIsPlaying(false);
+      setIsLoading(false);
       syncMediaSessionPlayback('paused');
     };
 
@@ -184,7 +311,11 @@ export function useAudioEngine(onEnded?: () => void) {
 
     const handleTimeUpdate = () => {
       const now = Date.now();
-      setCurrentTime(audio.currentTime || 0);
+      const t = audio.currentTime || 0;
+      if (t > 0 && isFinite(t)) {
+        lastKnownTimeRef.current = t;
+      }
+      setCurrentTime(t);
       if (audio.duration && isFinite(audio.duration)) {
         setDuration(audio.duration);
       }
@@ -198,11 +329,22 @@ export function useAudioEngine(onEnded?: () => void) {
       setIsLoading(false);
       if (audio.duration && isFinite(audio.duration)) {
         setDuration(audio.duration);
+        if (pendingSeekTimeRef.current !== null && pendingSeekTimeRef.current > 0) {
+          const target = Math.min(pendingSeekTimeRef.current, Math.max(0, audio.duration - 0.5));
+          pendingSeekTimeRef.current = null;
+          try {
+            audio.currentTime = target;
+            setCurrentTime(target);
+          } catch {}
+        }
         updateMediaPosition();
       }
     };
 
     const handleEnded = () => {
+      clearResumeWatchdog();
+      lastKnownTimeRef.current = 0;
+      pendingSeekTimeRef.current = null;
       setIsPlaying(false);
       setIsLoading(false);
       if (onEndedRef.current) {
@@ -214,25 +356,37 @@ export function useAudioEngine(onEnded?: () => void) {
 
     const handleError = () => {
       if (!audio.error) return;
-      // На iOS при переходе сети/фона даём 1 автоматический ретрай перед остановкой
+      clearResumeWatchdog();
+
       if (shouldPlayRef.current && retryCountRef.current < 1 && lastSrcRef.current) {
         retryCountRef.current += 1;
+        if (lastKnownTimeRef.current > 0.5) {
+          pendingSeekTimeRef.current = lastKnownTimeRef.current;
+        }
         setTimeout(() => {
           if (!shouldPlayRef.current || !audioRef.current) return;
           audioRef.current.src = lastSrcRef.current;
-          audioRef.current.play().catch(() => {
-            shouldPlayRef.current = false;
-            setIsLoading(false);
-            setIsPlaying(false);
-          });
-        }, 350);
+          audioRef.current.play().catch(() => {});
+        }, 200);
         return;
       }
+
+      if (shouldPlayRef.current && consecutiveErrorsRef.current < 5) {
+        consecutiveErrorsRef.current += 1;
+        setIsLoading(false);
+        const skipToNext = onErrorRef.current || onEndedRef.current;
+        if (skipToNext) {
+          skipToNext();
+          return;
+        }
+      }
+
       shouldPlayRef.current = false;
       setIsLoading(false);
       setIsPlaying(false);
     };
 
+    audio.addEventListener('play', handlePlayEvent);
     audio.addEventListener('playing', handlePlaying);
     audio.addEventListener('pause', handlePause);
     audio.addEventListener('waiting', handleWaiting);
@@ -243,7 +397,21 @@ export function useAudioEngine(onEnded?: () => void) {
     audio.addEventListener('ended', handleEnded);
     audio.addEventListener('error', handleError);
 
+    // Регистрируем системные кнопки Play/Pause для iOS Control Center / экрана блокировки
+    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+      try {
+        navigator.mediaSession.setActionHandler('play', () => {
+          resume();
+        });
+        navigator.mediaSession.setActionHandler('pause', () => {
+          pause();
+        });
+      } catch {}
+    }
+
     return () => {
+      clearResumeWatchdog();
+      audio.removeEventListener('play', handlePlayEvent);
       audio.removeEventListener('playing', handlePlaying);
       audio.removeEventListener('pause', handlePause);
       audio.removeEventListener('waiting', handleWaiting);
@@ -254,7 +422,7 @@ export function useAudioEngine(onEnded?: () => void) {
       audio.removeEventListener('ended', handleEnded);
       audio.removeEventListener('error', handleError);
     };
-  }, []);
+  }, [resume, pause, clearResumeWatchdog]);
 
   const playStream = useCallback(
     async (src: string) => {
@@ -262,17 +430,18 @@ export function useAudioEngine(onEnded?: () => void) {
       if (!audio || typeof src !== 'string' || !src) return;
 
       ensureAudioGraph(false);
+      clearResumeWatchdog();
 
       const reqId = ++playRequestIdRef.current;
       retryCountRef.current = 0;
+      lastKnownTimeRef.current = 0;
+      pendingSeekTimeRef.current = null;
       lastSrcRef.current = src;
       shouldPlayRef.current = true;
       setIsLoading(true);
       setCurrentTime(0);
       setDuration(0);
 
-      // ВАЖНО для iOS: не вызываем audio.pause() и audio.load() перед сменой src,
-      // иначе Safari разрывает фоновую аудио-сессию и блокирует воспроизведение на заблокированном экране.
       audio.src = src;
 
       try {
@@ -290,57 +459,32 @@ export function useAudioEngine(onEnded?: () => void) {
         }
       }
     },
-    [ensureAudioGraph]
+    [ensureAudioGraph, clearResumeWatchdog]
   );
 
   const togglePlay = useCallback(async () => {
     const audio = audioRef.current;
     if (!audio) return;
 
-    const src = audio.currentSrc || audio.src || lastSrcRef.current;
-    if (!src) return;
-
-    ensureAudioGraph(false);
+    // Защита от двойного срабатывания на iOS, когда Safari сам снял трек с паузы прямо перед вызовом togglePlay()
+    if (!audio.paused && Date.now() - lastNativePlayTimeRef.current < 500) {
+      shouldPlayRef.current = true;
+      setIsPlaying(true);
+      return;
+    }
 
     if (audio.paused || audio.ended || audio.error) {
-      const reqId = ++playRequestIdRef.current;
-      if (audio.error || audio.readyState === 0 || !audio.src) {
-        audio.src = src;
-      }
-      shouldPlayRef.current = true;
-      setIsLoading(true);
-      try {
-        await audio.play();
-        if (playRequestIdRef.current === reqId) {
-          setIsPlaying(true);
-        }
-      } catch (err: any) {
-        if (playRequestIdRef.current === reqId && err?.name !== 'AbortError') {
-          setIsPlaying(false);
-        }
-      } finally {
-        if (playRequestIdRef.current === reqId) {
-          setIsLoading(false);
-        }
-      }
+      await resume();
     } else {
-      shouldPlayRef.current = false;
-      audio.pause();
+      pause();
     }
-  }, [ensureAudioGraph]);
-
-  const pause = useCallback(() => {
-    shouldPlayRef.current = false;
-    const audio = audioRef.current;
-    if (audio && !audio.paused) {
-      audio.pause();
-    }
-  }, []);
+  }, [resume, pause]);
 
   const seek = useCallback((timeSec: number) => {
     const audio = audioRef.current;
     if (!audio || !isFinite(timeSec)) return;
     const clamped = Math.max(0, Math.min(timeSec, audio.duration || timeSec));
+    lastKnownTimeRef.current = clamped;
     audio.currentTime = clamped;
     setCurrentTime(clamped);
   }, []);
@@ -396,6 +540,7 @@ export function useAudioEngine(onEnded?: () => void) {
     eqGains,
     activePreset,
     playStream,
+    resume,
     togglePlay,
     pause,
     seek,

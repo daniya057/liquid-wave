@@ -32,13 +32,17 @@ let cachedScClientId: { id: string; expiresAt: number } | null = null;
 
 const UNWANTED_MODIFIERS = [
   'remix',
+  'remixed',
   'rmx',
   'edit',
   'vip',
   'flip',
   'bootleg',
   'mashup',
+  'mash-up',
   'rework',
+  're-work',
+  're-edit',
   'live',
   'concert',
   'tour',
@@ -50,13 +54,17 @@ const UNWANTED_MODIFIERS = [
   'reverb',
   'sped up',
   'speed up',
+  'speedup',
   'nightcore',
   '8d',
+  '8-d',
   'bass boosted',
   'bassboost',
   'cover',
   'karaoke',
   'instrumental',
+  'acapella',
+  'a capella',
   'tribute',
   'parody',
   'snippet',
@@ -77,6 +85,15 @@ const UNWANTED_MODIFIERS = [
   'ringtone',
   'reaction',
   'review',
+  'hardstyle',
+  'phonk',
+  'drum cover',
+  'guitar cover',
+  'bass cover',
+  'piano cover',
+  'vocal cover',
+  'russian version',
+  'на русском',
   'ремикс',
   'концерт',
   'лайв',
@@ -86,6 +103,7 @@ const UNWANTED_MODIFIERS = [
   'кавер',
   'минус',
   'инструментал',
+  'акапелла',
   'пародия',
   'бит',
   'микс',
@@ -96,6 +114,27 @@ const UNWANTED_MODIFIERS = [
   'подкаст',
   'рингтон',
 ];
+
+// Слова, которые однозначно выдают ремикс/обрезку даже если написаны слитно (DualityRemix, NightcoreLab)
+const SUBSTRING_BANNED_WORDS = [
+  'remix',
+  'bootleg',
+  'mashup',
+  'nightcore',
+  'slowed',
+  'speedup',
+  'bassboost',
+  'karaoke',
+  'acapella',
+  'ringtone',
+  'ремикс',
+  'кавер',
+  'найткор',
+  'замедл',
+];
+
+const BENIGN_BRACKET_RE =
+  /^(?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|original|original mix|album version|single version|remaster(?:ed)?(?:\s+\d{4})?|from\s+.+|feat\.?\s+.+|ft\.?\s+.+|with\s+.+|prod\.?\s+.+|клип|премьера|текст|аудио|видео|официальный|оригинал)$/i;
 
 const STOP_WORDS = new Set([
   'feat',
@@ -115,6 +154,8 @@ const STOP_WORDS = new Set([
   'clean',
   'remastered',
   'remaster',
+  'original',
+  'version',
   'hd',
   'hq',
   '4k',
@@ -183,11 +224,11 @@ function stripFeaturingAndTags(raw: string): string {
     .replace(/\[(?:feat\.?|ft\.?|with|prod\.?)\s+[^\]]+\]/gi, '')
     .replace(/\s+(?:feat\.?|ft\.?)\s+.+$/i, '')
     .replace(
-      /\((?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|remaster(?:ed)?(?:\s+\d{4})?|клип|премьера|текст|аудио|видео)[^)]*\)/gi,
+      /\((?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|original(?:\s+mix)?|album\s+version|single\s+version|remaster(?:ed)?(?:\s+\d{4})?|клип|премьера|текст|аудио|видео)[^)]*\)/gi,
       ''
     )
     .replace(
-      /\[(?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|remaster(?:ed)?(?:\s+\d{4})?|клип|премьера|текст|аудио|видео)[^\]]*\]/gi,
+      /\[(?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|original(?:\s+mix)?|album\s+version|single\s+version|remaster(?:ed)?(?:\s+\d{4})?|клип|премьера|текст|аудио|видео)[^\]]*\]/gi,
       ''
     )
     .replace(/\s{2,}/g, ' ')
@@ -197,11 +238,11 @@ function stripFeaturingAndTags(raw: string): string {
 function cleanTrackQuery(raw: string): string {
   return raw
     .replace(
-      /\((?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|клип|премьера|текст|аудио|видео)[^)]*\)/gi,
+      /\((?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|original(?:\s+mix)?|remaster(?:ed)?(?:\s+\d{4})?|клип|премьера|текст|аудио|видео)[^)]*\)/gi,
       ''
     )
     .replace(
-      /\[(?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|клип|премьера|текст|аудио|видео)[^\]]*\]/gi,
+      /\[(?:official|music|lyric|lyrics|audio|video|visualizer|hd|hq|4k|8k|explicit|clean|original(?:\s+mix)?|remaster(?:ed)?(?:\s+\d{4})?|клип|премьера|текст|аудио|видео)[^\]]*\]/gi,
       ''
     )
     .replace(/\s{2,}/g, ' ')
@@ -242,12 +283,33 @@ function parseDurationSec(text?: string): number {
 function hasUnwantedVariant(text: string, allowedQuery: string): boolean {
   const qLower = allowedQuery.toLowerCase();
   const tLower = text.toLowerCase();
+
+  for (const sub of SUBSTRING_BANNED_WORDS) {
+    if (!qLower.includes(sub) && tLower.includes(sub)) {
+      return true;
+    }
+  }
+
   return UNWANTED_MODIFIERS.some((mod) => {
     if (qLower.includes(mod)) return false;
     const escaped = mod.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const regex = new RegExp(`(?:^|[^\\p{L}\\p{N}])${escaped}(?:$|[^\\p{L}\\p{N}])`, 'u');
     return regex.test(tLower);
   });
+}
+
+function hasSuspiciousParenthetical(candidateTitle: string, allowedContext: string): boolean {
+  const allowedLower = allowedContext.toLowerCase();
+  const matches = [...candidateTitle.matchAll(/[\(\[]([^\)\]]+)[\)\]]/g)];
+  for (const m of matches) {
+    const inner = (m[1] || '').trim();
+    if (!inner) continue;
+    if (allowedLower.includes(inner.toLowerCase())) continue;
+    if (BENIGN_BRACKET_RE.test(inner)) continue;
+    // Если в скобках что-то левое (например "(DJ Vasya Flip)", "(Guitar)", "(Slowed)", "(На русском)")
+    return true;
+  }
+  return false;
 }
 
 function setBufferCache(key: string, entry: CachedBuffer) {
@@ -319,6 +381,7 @@ async function lookupReferenceDurationSec(title: string, artist: string): Promis
 function scoreCandidateMatch(params: {
   candidateTitle: string;
   candidateArtist: string;
+  candidateMeta?: string;
   candidateDurationSec: number;
   targetTitle: string;
   targetArtist: string;
@@ -328,6 +391,7 @@ function scoreCandidateMatch(params: {
   const {
     candidateTitle,
     candidateArtist,
+    candidateMeta = '',
     candidateDurationSec,
     targetTitle,
     targetArtist,
@@ -336,12 +400,19 @@ function scoreCandidateMatch(params: {
   } = params;
 
   const allowedContext = `${targetArtist} ${targetTitle} ${fallbackQuery}`.trim();
-  const candCombined = `${candidateArtist} ${candidateTitle}`.toLowerCase();
+  const candCombined = `${candidateArtist} ${candidateTitle} ${candidateMeta}`.toLowerCase();
 
+  // 1. Жёстко отсекаем ремиксы, каверы, бутлеги, slowed/sped up, live, миксы (включая теги и жанр)
   if (hasUnwantedVariant(candCombined, allowedContext)) {
     return -10000;
   }
 
+  // 2. Отсекаем посторонние пометки в скобках "(DJ Flip)", "(Piano)", "(На русском)" и т.п.
+  if (hasSuspiciousParenthetical(candidateTitle, allowedContext)) {
+    return -10000;
+  }
+
+  // 3. Жёсткая проверка длительности
   const allowsShort = /(?:^|\s)(?:intro|outro|skit|interlude|интро|аутро|скит|интерлюдия)(?:\s|$)/i.test(
     allowedContext
   );
@@ -351,7 +422,7 @@ function scoreCandidateMatch(params: {
 
   if (candidateDurationSec > 0) {
     if (expectedDurationSec > 0) {
-      const tolerance = Math.max(15, Math.round(expectedDurationSec * 0.08));
+      const tolerance = Math.max(12, Math.round(expectedDurationSec * 0.07));
       if (Math.abs(candidateDurationSec - expectedDurationSec) > tolerance) {
         return -10000;
       }
@@ -361,8 +432,11 @@ function scoreCandidateMatch(params: {
     }
   }
 
-  const candAllTokens = buildTokenSet(candCombined);
-  const candTitleTokens = buildTokenSet(stripFeaturingAndTags(candidateTitle));
+  // 4. Прямая и обратная проверка слов названия
+  const candAllTokens = buildTokenSet(`${candidateArtist} ${candidateTitle}`);
+  const strippedCandTitle = stripFeaturingAndTags(candidateTitle);
+  const candTitleTokenList = tokenize(strippedCandTitle);
+  const candTitleTokens = buildTokenSet(strippedCandTitle);
 
   const coreTitle = stripFeaturingAndTags(targetTitle) || targetTitle || fallbackQuery;
   const titleTokens = tokenize(coreTitle);
@@ -376,13 +450,33 @@ function scoreCandidateMatch(params: {
   }
 
   const titleRatio = matchedTitleCount / titleTokens.length;
-  const minTitleRatio = titleTokens.length <= 2 ? 1.0 : 0.7;
+  const minTitleRatio = titleTokens.length <= 2 ? 1.0 : 0.75;
   if (matchedTitleCount === 0 || titleRatio < minTitleRatio) {
     return -10000;
   }
 
-  let score = Math.round(titleRatio * 240);
+  // Считаем сколько в заголовке кандидата "лишних" слов, не относящихся ни к треку, ни к артисту
+  const expectedKnownTokens = buildTokenSet(`${targetArtist} ${coreTitle}`);
+  let unexplainedExtraWords = 0;
+  for (const tok of candTitleTokenList) {
+    if (!tokensMatch(tok, expectedKnownTokens)) {
+      unexplainedExtraWords++;
+    }
+  }
 
+  // Если в заголовке 3 и более левых слова ("Slipknot - Duality Metalstep Flip 2024") — это не оригинал
+  if (unexplainedExtraWords >= 3) {
+    return -10000;
+  }
+
+  let score = Math.round(titleRatio * 240);
+  if (unexplainedExtraWords === 0) {
+    score += 180;
+  } else {
+    score -= unexplainedExtraWords * 110;
+  }
+
+  // 5. Проверка артиста
   if (targetArtist) {
     const primaryArtist = targetArtist.split(/[,&]|feat\.?|ft\.?/i)[0].trim() || targetArtist;
     const artistTokens = tokenize(primaryArtist);
@@ -398,7 +492,7 @@ function scoreCandidateMatch(params: {
           expectedDurationSec > 0 &&
           candidateDurationSec > 0 &&
           Math.abs(candidateDurationSec - expectedDurationSec) <= 3;
-        if (!exactDurationMatch || titleRatio < 1.0) {
+        if (!exactDurationMatch || titleRatio < 1.0 || unexplainedExtraWords > 0) {
           return -10000;
         }
         score -= 60;
@@ -406,11 +500,12 @@ function scoreCandidateMatch(params: {
     }
   }
 
+  // 6. Бонусы за точное совпадение длительности
   if (expectedDurationSec > 0 && candidateDurationSec > 0) {
     const diff = Math.abs(candidateDurationSec - expectedDurationSec);
-    if (diff <= 3) score += 260;
-    else if (diff <= 7) score += 160;
-    else if (diff <= 14) score += 50;
+    if (diff <= 2) score += 280;
+    else if (diff <= 5) score += 190;
+    else if (diff <= 12) score += 70;
   }
 
   return score;
@@ -506,7 +601,7 @@ async function searchYoutubeMusicSong(
           expectedDurationSec,
         }),
       }))
-      .filter((x) => x.score >= 220)
+      .filter((x) => x.score >= 240)
       .sort((a, b) => b.score - a.score)[0]?.c;
 
     if (!best) return null;
@@ -690,10 +785,6 @@ async function searchSoundCloudRaw(query: string, clientId: string): Promise<any
   return Array.isArray(data?.collection) ? data.collection : [];
 }
 
-/**
- * Скачивает и склеивает HLS-плейлист SoundCloud (включая #EXT-X-MAP init-сегмент для fMP4 AAC).
- * Отбрасывает 30-секундные Go+ превью, если ожидается полный трек.
- */
 async function buildHlsAudioBuffer(
   m3u8Url: string,
   expectedDurationSec: number,
@@ -766,7 +857,6 @@ async function buildHlsAudioBuffer(
     throw new Error('Empty HLS segments');
   }
 
-  // Жёстко отсекаем 30-секундные Go+ превью-обрезки
   if (expectedDurationSec >= 90 && totalPlaylistDurationSec > 0 && totalPlaylistDurationSec < 45) {
     throw new Error(`HLS stream is a ${Math.round(totalPlaylistDurationSec)}s snippet`);
   }
@@ -843,6 +933,8 @@ async function fetchFromSoundCloudQuery(
     }
   }
 
+  const primaryArtistTokens = tokenize(primaryArtist);
+
   const rankedTracks = items
     .filter((item) => {
       if (!Array.isArray(item?.media?.transcodings)) return false;
@@ -859,10 +951,12 @@ async function fetchFromSoundCloudQuery(
       const artistStr = [item.user?.username, item.publisher_metadata?.artist]
         .filter(Boolean)
         .join(' ');
+      const metaStr = [item.tag_list, item.genre].filter(Boolean).join(' ');
 
       let score = scoreCandidateMatch({
         candidateTitle: titleStr,
         candidateArtist: artistStr,
+        candidateMeta: metaStr,
         candidateDurationSec: durSec,
         targetTitle: cleanTrackQuery(targetTitle),
         targetArtist,
@@ -871,24 +965,39 @@ async function fetchFromSoundCloudQuery(
       });
 
       if (score >= 0) {
+        // Приоритет официальным аккаунтам и метаданным правообладателя
+        const userTokenSet = buildTokenSet(
+          `${item.user?.username || ''} ${item.publisher_metadata?.artist || ''}`
+        );
+        const isArtistAccount =
+          primaryArtistTokens.length > 0 &&
+          primaryArtistTokens.every((tok) => tokensMatch(tok, userTokenSet));
+
+        if (isArtistAccount) score += 200;
+        if (item.user?.verified) score += 120;
+        if (item.publisher_metadata?.isrc || item.publisher_metadata?.release_title) score += 90;
+
+        // Бонус за популярность (оригинальные треки/ре-аплоады набирают тысячи прослушиваний, в отличие от bedroom-каверов)
+        const plays = Number(item.playback_count || 0);
+        if (plays > 0) {
+          score += Math.min(70, Math.round(Math.log10(plays + 1) * 12));
+        }
+
         const hasProgressive = item.media.transcodings.some(
           (t: any) => isSafariCompatibleTranscoding(t) && t?.format?.protocol === 'progressive'
         );
-        if (hasProgressive) score += 60;
-        if (item.publisher_metadata?.isrc || item.publisher_metadata?.release_title) score += 50;
-        if (item.user?.verified) score += 40;
+        if (hasProgressive) score += 40;
       }
 
       return { item, score };
     })
-    .filter((entry) => entry.score >= 220)
+    .filter((entry) => entry.score >= 260)
     .sort((a, b) => b.score - a.score)
     .map((entry) => entry.item);
 
   for (const track of rankedTracks) {
     const compatible = track.media.transcodings.filter(isSafariCompatibleTranscoding);
 
-    // Сортируем: 1) progressive MP3, 2) HLS MP3, 3) HLS AAC/MP4 (160k -> 96k)
     const orderedTranscodings = [
       ...compatible.filter((t: any) => t?.format?.protocol === 'progressive'),
       ...compatible.filter(
@@ -925,7 +1034,6 @@ async function fetchFromSoundCloudQuery(
           };
         }
 
-        // Для HLS сразу собираем полный буфер (с #EXT-X-MAP) и проверяем длительность
         const built = await buildHlsAudioBuffer(info.url, expectedDurationSec, hintMime);
         const bufKey = `${cacheKey}:sc:${track.id}:${tc.preset || 'hls'}`;
         setBufferCache(bufKey, {
@@ -1042,7 +1150,6 @@ async function getAudioSource(
     videoId = ytmHit.videoId;
   }
 
-  // 1. Пробуем прямой поток YouTube
   if (videoId) {
     try {
       const ytSource = await tryYoutubeDirect(videoId);
@@ -1070,7 +1177,6 @@ async function getAudioSource(
     }
   }
 
-  // 2. Резерв через SoundCloud (progressive MP3 + HLS MP3 + HLS AAC fMP4 с #EXT-X-MAP)
   const scSource = await fetchFromSoundCloudQuery(
     query || rawId,
     resolvedTitle,

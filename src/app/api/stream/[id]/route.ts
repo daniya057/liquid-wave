@@ -12,6 +12,7 @@ interface AudioSource {
   userAgent: string;
   provider: 'youtube' | 'soundcloud';
   isHls?: boolean;
+  bufferKey?: string;
 }
 
 interface CachedBuffer {
@@ -250,7 +251,7 @@ function hasUnwantedVariant(text: string, allowedQuery: string): boolean {
 }
 
 function setBufferCache(key: string, entry: CachedBuffer) {
-  if (fullAudioBufferCache.size >= 10) {
+  if (fullAudioBufferCache.size >= 12) {
     const oldestKey = fullAudioBufferCache.keys().next().value;
     if (oldestKey) fullAudioBufferCache.delete(oldestKey);
   }
@@ -337,12 +338,10 @@ function scoreCandidateMatch(params: {
   const allowedContext = `${targetArtist} ${targetTitle} ${fallbackQuery}`.trim();
   const candCombined = `${candidateArtist} ${candidateTitle}`.toLowerCase();
 
-  // 1. Жёстко блокируем ремиксы, миксы, альбомы, каверы, замедленные/ускоренные версии и сниппеты
   if (hasUnwantedVariant(candCombined, allowedContext)) {
     return -10000;
   }
 
-  // 2. Жёсткая проверка длительности: отсекаем 1-минутные обрезки и 30-минутные миксы
   const allowsShort = /(?:^|\s)(?:intro|outro|skit|interlude|интро|аутро|скит|интерлюдия)(?:\s|$)/i.test(
     allowedContext
   );
@@ -362,7 +361,6 @@ function scoreCandidateMatch(params: {
     }
   }
 
-  // 3. Проверка совпадения названия трека
   const candAllTokens = buildTokenSet(candCombined);
   const candTitleTokens = buildTokenSet(stripFeaturingAndTags(candidateTitle));
 
@@ -385,7 +383,6 @@ function scoreCandidateMatch(params: {
 
   let score = Math.round(titleRatio * 240);
 
-  // 4. Проверка совпадения артиста (в username, metadata ИЛИ в заголовке вида "Artist - Title")
   if (targetArtist) {
     const primaryArtist = targetArtist.split(/[,&]|feat\.?|ft\.?/i)[0].trim() || targetArtist;
     const artistTokens = tokenize(primaryArtist);
@@ -409,7 +406,6 @@ function scoreCandidateMatch(params: {
     }
   }
 
-  // 5. Бонусы за точную длительность
   if (expectedDurationSec > 0 && candidateDurationSec > 0) {
     const diff = Math.abs(candidateDurationSec - expectedDurationSec);
     if (diff <= 3) score += 260;
@@ -596,6 +592,9 @@ async function fetchInnerTubeMp4(
 
 async function tryYoutubeDirect(videoId: string): Promise<AudioSource> {
   return Promise.any([
+    fetchInnerTubeMp4(videoId, 'WEB_EMBEDDED_PLAYER', '1.20260101.00.00', BROWSER_UA, {
+      thirdParty: { embedUrl: 'https://www.youtube.com/' },
+    }),
     fetchInnerTubeMp4(
       videoId,
       'ANDROID_VR',
@@ -668,7 +667,7 @@ async function getSoundCloudClientId(): Promise<string> {
   return 'iZIs9schVcX5lhOfkWznGGPLICJaEMpy';
 }
 
-function isSafariCompatibleMp3Transcoding(t: any): boolean {
+function isSafariCompatibleTranscoding(t: any): boolean {
   if (!t?.url || typeof t.url !== 'string') return false;
   if (t.snipped === true) return false;
   if (t.url.includes('/preview/')) return false;
@@ -691,16 +690,143 @@ async function searchSoundCloudRaw(query: string, clientId: string): Promise<any
   return Array.isArray(data?.collection) ? data.collection : [];
 }
 
+/**
+ * Скачивает и склеивает HLS-плейлист SoundCloud (включая #EXT-X-MAP init-сегмент для fMP4 AAC).
+ * Отбрасывает 30-секундные Go+ превью, если ожидается полный трек.
+ */
+async function buildHlsAudioBuffer(
+  m3u8Url: string,
+  expectedDurationSec: number,
+  hintMimeType: string
+): Promise<{ bytes: Uint8Array; contentType: string }> {
+  const m3u8Res = await fetch(m3u8Url, {
+    headers: { 'User-Agent': BROWSER_UA },
+    signal: AbortSignal.timeout(4500),
+  });
+  if (!m3u8Res.ok) {
+    throw new Error('Failed to load HLS playlist');
+  }
+
+  const m3u8Text = await m3u8Res.text();
+  const lines = m3u8Text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  let initSegment: { url: string; range?: string } | null = null;
+  const mediaSegments: { url: string; range?: string }[] = [];
+  let pendingByteRange: string | undefined;
+  let totalPlaylistDurationSec = 0;
+
+  for (const line of lines) {
+    if (line.startsWith('#EXT-X-MAP:')) {
+      const attrs = line.slice('#EXT-X-MAP:'.length);
+      const uriMatch = attrs.match(/URI="([^"]+)"/i);
+      const brMatch = attrs.match(/BYTERANGE="(\d+)(?:@(\d+))?"/i);
+      if (uriMatch?.[1]) {
+        const resolvedUrl = new URL(uriMatch[1], m3u8Url).toString();
+        let range: string | undefined;
+        if (brMatch) {
+          const len = Number(brMatch[1]);
+          const offset = brMatch[2] ? Number(brMatch[2]) : 0;
+          range = `bytes=${offset}-${offset + len - 1}`;
+        }
+        initSegment = { url: resolvedUrl, range };
+      }
+      continue;
+    }
+
+    if (line.startsWith('#EXTINF:')) {
+      const durStr = line.slice('#EXTINF:'.length).split(',')[0];
+      const dur = parseFloat(durStr);
+      if (!isNaN(dur) && dur > 0) totalPlaylistDurationSec += dur;
+      continue;
+    }
+
+    if (line.startsWith('#EXT-X-BYTERANGE:')) {
+      const brMatch = line.slice('#EXT-X-BYTERANGE:'.length).match(/^(\d+)(?:@(\d+))?$/);
+      if (brMatch) {
+        const len = Number(brMatch[1]);
+        const offset = brMatch[2] ? Number(brMatch[2]) : 0;
+        pendingByteRange = `bytes=${offset}-${offset + len - 1}`;
+      }
+      continue;
+    }
+
+    if (line.startsWith('#')) {
+      continue;
+    }
+
+    const resolvedSegUrl = new URL(line, m3u8Url).toString();
+    mediaSegments.push({ url: resolvedSegUrl, range: pendingByteRange });
+    pendingByteRange = undefined;
+  }
+
+  if (mediaSegments.length === 0) {
+    throw new Error('Empty HLS segments');
+  }
+
+  // Жёстко отсекаем 30-секундные Go+ превью-обрезки
+  if (expectedDurationSec >= 90 && totalPlaylistDurationSec > 0 && totalPlaylistDurationSec < 45) {
+    throw new Error(`HLS stream is a ${Math.round(totalPlaylistDurationSec)}s snippet`);
+  }
+
+  const allParts = initSegment ? [initSegment, ...mediaSegments] : mediaSegments;
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  for (let i = 0; i < allParts.length; i += 10) {
+    const batch = allParts.slice(i, i + 10);
+    const buffers = await Promise.all(
+      batch.map(async (part) => {
+        const headers: Record<string, string> = { 'User-Agent': BROWSER_UA };
+        if (part.range) headers['Range'] = part.range;
+        const r = await fetch(part.url, { headers, signal: AbortSignal.timeout(5000) });
+        if (!r.ok && r.status !== 206) throw new Error('HLS segment failed ' + r.status);
+        return new Uint8Array(await r.arrayBuffer());
+      })
+    );
+    for (const buf of buffers) {
+      chunks.push(buf);
+      totalBytes += buf.byteLength;
+    }
+  }
+
+  if (totalBytes < 16384) {
+    throw new Error('HLS buffer too small');
+  }
+
+  const merged = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  const isMp4 =
+    Boolean(initSegment) ||
+    hintMimeType.toLowerCase().includes('mp4') ||
+    hintMimeType.toLowerCase().includes('aac') ||
+    mediaSegments[0].url.includes('.mp4') ||
+    mediaSegments[0].url.includes('.m4s');
+
+  return {
+    bytes: merged,
+    contentType: isMp4 ? 'audio/mp4' : 'audio/mpeg',
+  };
+}
+
 async function fetchFromSoundCloudQuery(
   rawQuery: string,
   targetTitle: string,
   targetArtist: string,
-  expectedDurationSec = 0
+  expectedDurationSec: number,
+  cacheKey: string
 ): Promise<AudioSource> {
   const clientId = await getSoundCloudClientId();
   const cleanQuery = cleanTrackQuery(rawQuery) || rawQuery;
 
-  let items = await searchSoundCloudRaw(cleanQuery, clientId);
+  const items = await searchSoundCloudRaw(cleanQuery, clientId);
 
   const strippedTitle = stripFeaturingAndTags(targetTitle);
   const primaryArtist = targetArtist.split(/[,&]|feat\.?|ft\.?/i)[0].trim();
@@ -746,7 +872,7 @@ async function fetchFromSoundCloudQuery(
 
       if (score >= 0) {
         const hasProgressive = item.media.transcodings.some(
-          (t: any) => isSafariCompatibleMp3Transcoding(t) && t?.format?.protocol === 'progressive'
+          (t: any) => isSafariCompatibleTranscoding(t) && t?.format?.protocol === 'progressive'
         );
         if (hasProgressive) score += 60;
         if (item.publisher_metadata?.isrc || item.publisher_metadata?.release_title) score += 50;
@@ -760,115 +886,72 @@ async function fetchFromSoundCloudQuery(
     .map((entry) => entry.item);
 
   for (const track of rankedTracks) {
-    // 1. Сначала проверяем прямой progressive MP3
-    const progressive = track.media.transcodings.find(
-      (t: any) => isSafariCompatibleMp3Transcoding(t) && t?.format?.protocol === 'progressive'
-    );
-    if (progressive) {
+    const compatible = track.media.transcodings.filter(isSafariCompatibleTranscoding);
+
+    // Сортируем: 1) progressive MP3, 2) HLS MP3, 3) HLS AAC/MP4 (160k -> 96k)
+    const orderedTranscodings = [
+      ...compatible.filter((t: any) => t?.format?.protocol === 'progressive'),
+      ...compatible.filter(
+        (t: any) =>
+          t?.format?.protocol === 'hls' &&
+          String(t?.format?.mime_type || '').toLowerCase().includes('mpeg')
+      ),
+      ...compatible.filter(
+        (t: any) =>
+          t?.format?.protocol === 'hls' &&
+          !String(t?.format?.mime_type || '').toLowerCase().includes('mpeg')
+      ),
+    ];
+
+    for (const tc of orderedTranscodings) {
       try {
-        const infoRes = await fetch(`${progressive.url}?client_id=${clientId}`, {
+        const infoRes = await fetch(`${tc.url}?client_id=${clientId}`, {
           signal: AbortSignal.timeout(3000),
         });
-        if (infoRes.ok) {
-          const info = await infoRes.json();
-          if (info?.url && !info.url.includes('/preview/')) {
-            return {
-              url: info.url,
-              mimeType: 'audio/mpeg',
-              userAgent: BROWSER_UA,
-              provider: 'soundcloud',
-              isHls: false,
-            };
-          }
-        }
-      } catch {}
-    }
+        if (!infoRes.ok) continue;
+        const info = await infoRes.json();
+        if (!info?.url || info.url.includes('/preview/')) continue;
 
-    // 2. Если progressive нет (90% треков лейблов и новых загрузок на SC) — берём HLS audio/mpeg
-    const hls = track.media.transcodings.find(
-      (t: any) => isSafariCompatibleMp3Transcoding(t) && t?.format?.protocol === 'hls'
-    );
-    if (hls) {
-      try {
-        const infoRes = await fetch(`${hls.url}?client_id=${clientId}`, {
-          signal: AbortSignal.timeout(3000),
+        const isHls = tc?.format?.protocol === 'hls' || info.url.includes('.m3u8');
+        const hintMime = String(tc?.format?.mime_type || 'audio/mpeg');
+
+        if (!isHls) {
+          return {
+            url: info.url,
+            mimeType: hintMime.includes('mp4') ? 'audio/mp4' : 'audio/mpeg',
+            userAgent: BROWSER_UA,
+            provider: 'soundcloud',
+            isHls: false,
+          };
+        }
+
+        // Для HLS сразу собираем полный буфер (с #EXT-X-MAP) и проверяем длительность
+        const built = await buildHlsAudioBuffer(info.url, expectedDurationSec, hintMime);
+        const bufKey = `${cacheKey}:sc:${track.id}:${tc.preset || 'hls'}`;
+        setBufferCache(bufKey, {
+          bytes: built.bytes,
+          contentType: built.contentType,
+          expiresAt: Date.now() + 1000 * 60 * 30,
         });
-        if (infoRes.ok) {
-          const info = await infoRes.json();
-          if (info?.url && !info.url.includes('/preview/')) {
-            return {
-              url: info.url,
-              mimeType: 'audio/mpeg',
-              userAgent: BROWSER_UA,
-              provider: 'soundcloud',
-              isHls: true,
-            };
-          }
-        }
-      } catch {}
-    }
-  }
 
-  throw new Error('No full matching MP3 stream on SoundCloud');
-}
-
-async function serveHlsAsRangedMp3(
-  req: NextRequest,
-  cacheKey: string,
-  m3u8Url: string,
-  isHead: boolean
-) {
-  let cached = fullAudioBufferCache.get(cacheKey);
-
-  if (!cached || cached.expiresAt <= Date.now()) {
-    const m3u8Res = await fetch(m3u8Url, { signal: AbortSignal.timeout(4000) });
-    if (!m3u8Res.ok) {
-      return NextResponse.json({ error: 'Failed to load HLS playlist' }, { status: 502 });
-    }
-    const m3u8Text = await m3u8Res.text();
-    const segmentUrls = m3u8Text
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line.startsWith('http'));
-
-    if (segmentUrls.length === 0) {
-      return NextResponse.json({ error: 'Empty HLS segments' }, { status: 502 });
-    }
-
-    const chunks: Uint8Array[] = [];
-    let totalBytes = 0;
-
-    // Скачиваем сегменты параллельно пачками по 8 штук (~0.4 сек на всю песню)
-    for (let i = 0; i < segmentUrls.length; i += 8) {
-      const batch = segmentUrls.slice(i, i + 8);
-      const buffers = await Promise.all(
-        batch.map(async (segUrl) => {
-          const r = await fetch(segUrl, { signal: AbortSignal.timeout(5000) });
-          if (!r.ok) throw new Error('Segment failed');
-          return new Uint8Array(await r.arrayBuffer());
-        })
-      );
-      for (const buf of buffers) {
-        chunks.push(buf);
-        totalBytes += buf.byteLength;
+        return {
+          url: info.url,
+          mimeType: built.contentType,
+          userAgent: BROWSER_UA,
+          provider: 'soundcloud',
+          isHls: true,
+          bufferKey: bufKey,
+        };
+      } catch {
+        // Пробуем следующий транскодинг или следующий трек
       }
     }
-
-    const merged = new Uint8Array(totalBytes);
-    let offset = 0;
-    for (const chunk of chunks) {
-      merged.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-
-    cached = {
-      bytes: merged,
-      contentType: 'audio/mpeg',
-      expiresAt: Date.now() + 1000 * 60 * 30,
-    };
-    setBufferCache(cacheKey, cached);
   }
 
+  throw new Error('No full matching stream on SoundCloud');
+}
+
+function serveCachedBuffer(req: NextRequest, cached: CachedBuffer, isHead: boolean): Response {
   const total = cached.bytes.byteLength;
   const rangeHeader = req.headers.get('range');
 
@@ -912,18 +995,14 @@ async function getAudioSource(
   rawId: string,
   targetTitle: string,
   targetArtist: string,
-  expectedDurationSec = 0
+  expectedDurationSec: number,
+  cacheKey: string
 ): Promise<AudioSource> {
-  const cacheKey = `${rawId}:${targetTitle}:${targetArtist}:${expectedDurationSec}`;
   const cached = streamUrlCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
-    return {
-      url: cached.url,
-      mimeType: cached.mimeType,
-      userAgent: cached.userAgent,
-      provider: cached.provider,
-      isHls: cached.isHls,
-    };
+    if (!cached.isHls || (cached.bufferKey && fullAudioBufferCache.has(cached.bufferKey))) {
+      return cached;
+    }
   }
 
   let resolvedTitle = targetTitle;
@@ -944,7 +1023,6 @@ async function getAudioSource(
     }
   }
 
-  // Параллельно узнаём эталонную длительность и точный videoId на YouTube Music
   let effectiveDuration = expectedDurationSec;
   let videoId: string | null = !rawId.startsWith('ytq:') ? rawId : null;
 
@@ -964,7 +1042,7 @@ async function getAudioSource(
     videoId = ytmHit.videoId;
   }
 
-  // 1. Пробуем прямой поток YouTube (если Render не заблокирован по IP)
+  // 1. Пробуем прямой поток YouTube
   if (videoId) {
     try {
       const ytSource = await tryYoutubeDirect(videoId);
@@ -992,12 +1070,13 @@ async function getAudioSource(
     }
   }
 
-  // 2. Резерв через SoundCloud (progressive + HLS MP3 со строгим совпадением длительности)
+  // 2. Резерв через SoundCloud (progressive MP3 + HLS MP3 + HLS AAC fMP4 с #EXT-X-MAP)
   const scSource = await fetchFromSoundCloudQuery(
     query || rawId,
     resolvedTitle,
     resolvedArtist,
-    effectiveDuration
+    effectiveDuration,
+    cacheKey
   );
 
   streamUrlCache.set(cacheKey, {
@@ -1026,19 +1105,25 @@ async function handleStream(
     const expectedDurationSec = rawDuration > 10000 ? Math.round(rawDuration / 1000) : rawDuration;
     const targetTitle = safeDecode((req.nextUrl.searchParams.get('t') || '').trim());
     const targetArtist = safeDecode((req.nextUrl.searchParams.get('a') || '').trim());
-    const bufferKey = `${rawId}:${targetTitle}:${targetArtist}:${expectedDurationSec}`;
+    const cacheKey = `${rawId}:${targetTitle}:${targetArtist}:${expectedDurationSec}`;
 
-    const source = await getAudioSource(rawId, targetTitle, targetArtist, expectedDurationSec);
+    const source = await getAudioSource(
+      rawId,
+      targetTitle,
+      targetArtist,
+      expectedDurationSec,
+      cacheKey
+    );
 
     if (isPrefetch) {
-      if (source.isHls) {
-        await serveHlsAsRangedMp3(req, bufferKey, source.url, true).catch(() => {});
-      }
       return NextResponse.json({ ok: true });
     }
 
-    if (source.isHls) {
-      return serveHlsAsRangedMp3(req, bufferKey, source.url, isHead);
+    if (source.isHls && source.bufferKey) {
+      const buf = fullAudioBufferCache.get(source.bufferKey);
+      if (buf && buf.expiresAt > Date.now()) {
+        return serveCachedBuffer(req, buf, isHead);
+      }
     }
 
     const rangeHeader = req.headers.get('range');
@@ -1051,10 +1136,19 @@ async function handleStream(
     }).catch(() => null);
 
     if (!upstream || (!upstream.ok && upstream.status !== 206)) {
-      streamUrlCache.delete(bufferKey);
-      const retrySource = await getAudioSource(rawId, targetTitle, targetArtist, expectedDurationSec);
-      if (retrySource.isHls) {
-        return serveHlsAsRangedMp3(req, bufferKey, retrySource.url, isHead);
+      streamUrlCache.delete(cacheKey);
+      const retrySource = await getAudioSource(
+        rawId,
+        targetTitle,
+        targetArtist,
+        expectedDurationSec,
+        cacheKey
+      );
+      if (retrySource.isHls && retrySource.bufferKey) {
+        const buf = fullAudioBufferCache.get(retrySource.bufferKey);
+        if (buf && buf.expiresAt > Date.now()) {
+          return serveCachedBuffer(req, buf, isHead);
+        }
       }
       upstream = await fetch(retrySource.url, {
         method: isHead ? 'HEAD' : 'GET',

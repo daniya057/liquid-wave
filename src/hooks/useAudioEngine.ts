@@ -107,9 +107,7 @@ export function useAudioEngine(onEnded?: () => void) {
           prev.connect(ctx.destination);
           graphConnectedRef.current = true;
         }
-      } catch {
-        // Нативный <audio> работает напрямую
-      }
+      } catch {}
     },
     [eqGains]
   );
@@ -194,6 +192,7 @@ export function useAudioEngine(onEnded?: () => void) {
     };
 
     const handleError = () => {
+      if (!audio.error) return;
       shouldPlayRef.current = false;
       setIsLoading(false);
       setIsPlaying(false);
